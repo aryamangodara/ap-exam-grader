@@ -1,0 +1,27 @@
+# Secrets
+.env
+*service-account*.json
+*-credentials*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# All user-supplied PDFs (questions, answers, marking schemes)
+data/*.pdf
+data/*.PDF
+exams/**/*.pdf
+exams/**/*.PDF
+rubrics/*.pdf
+rubrics/*.PDF
+**/*.parsed.json
+
+# Generated scorecards
+out/*
+!out/.gitkeep
+
+# Local venv
+.venv/
+venv/
