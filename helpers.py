@@ -80,7 +80,9 @@ def get_gemini_client() -> genai.Client:
                 "GOOGLE_APPLICATION_CREDENTIALS is set but GOOGLE_CLOUD_PROJECT is not. "
                 "Add GOOGLE_CLOUD_PROJECT=<your-gcp-project-id> to Grader/.env."
             )
-        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+        # Gemini 3.x is served from the "global" endpoint on Vertex AI; regional
+        # endpoints like us-central1 return 404 for these models.
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
         return genai.Client(vertexai=True, project=project, location=location)
 
     raise RuntimeError(
@@ -101,13 +103,19 @@ def ocr_submission(
     question_images: list[Image.Image],
     answer_images: list[Image.Image],
     prompt_path: Path,
-    model: str = "gemini-2.5-pro",
+    model: str = "gemini-3.5-flash",
+    thinking_level: str | None = None,
 ) -> ParsedSubmission:
     """OCR the student's handwritten answers, using the question PDF as context.
 
     Both PDFs go in one call so Gemini uses the canonical question IDs from
     the question PDF when labeling each transcribed answer — no separate
     segmentation step needed.
+
+    `thinking_level` (Gemini 3.x): one of "minimal", "low", "medium", "high".
+    Transcription is not a reasoning task, so "low"/"minimal" cuts latency
+    sharply. Leave None to use the model's default. Ignored by models that
+    predate thinking_level (e.g. 2.5), which use the legacy thinking_budget.
     """
     prompt = Path(prompt_path).read_text(encoding="utf-8")
 
@@ -121,14 +129,18 @@ def ocr_submission(
         contents.append(f"[Answer PDF page {i}/{len(answer_images)}]")
         contents.append(img)
 
+    config_kwargs: dict = dict(
+        response_mime_type="application/json",
+        response_schema=ParsedSubmission,
+        temperature=0,
+    )
+    if thinking_level:
+        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+
     response = client.models.generate_content(
         model=model,
         contents=contents,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=ParsedSubmission,
-            temperature=0,
-        ),
+        config=types.GenerateContentConfig(**config_kwargs),
     )
 
     parsed = response.parsed
@@ -152,7 +164,7 @@ def load_rubric(
     year: int,
     set_label: str | None,
     prompt_path: Path,
-    model: str = "gemini-2.5-pro",
+    model: str = "gemini-3.5-flash",
     dpi: int = 200,
     force_reparse: bool = False,
 ) -> ParsedRubric:
@@ -252,7 +264,7 @@ def grade_question(
     subject: str,
     prompt_path: Path,
     subject_addendum: str = "",
-    model: str = "gemini-2.5-pro",
+    model: str = "gemini-3.5-flash",
     review_recommended: bool = False,
 ) -> QuestionScorecard:
     """Grade one transcribed answer against one question's rubric.
@@ -306,7 +318,7 @@ def grade_questions_parallel(
     subject: str,
     prompt_path: Path,
     subject_addendum: str = "",
-    model: str = "gemini-2.5-pro",
+    model: str = "gemini-3.5-flash",
     low_confidence_threshold: float = 0.75,
     max_workers: int = 8,
     verbose: bool = False,
