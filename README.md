@@ -103,6 +103,29 @@ All Pydantic models live in `schemas.py` and double as Gemini
 `response_schema`s. Prompts are plain text in `prompts/` and are read at call
 time, so you can iterate on them without touching Python.
 
+### Supported subjects
+
+Set `CONFIG["subject"]` to one of these canonical names (registered in
+`config.py`). A misspelled subject fails loudly with the full list.
+
+- AP Calculus AB / BC
+- AP Precalculus
+- AP Physics C: Mechanics
+- AP Physics C: Electricity and Magnetism
+- AP Environmental Science
+- AP Microeconomics
+- AP Macroeconomics
+- AP Psychology
+- AP World History: Modern
+- AP Human Geography
+- AP Comparative Government and Politics
+- AP English Language and Composition
+- AP Computer Science A
+- AP Computer Science Principles
+
+Each subject carries its own grading guidance (point structure, follow-through
+rules, what earns vs. doesn't earn credit) injected into the grading prompt.
+
 ### Adding a subject
 
 Edit `config.py`:
