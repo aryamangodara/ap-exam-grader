@@ -28,6 +28,7 @@ from schemas import (
     ParsedSubmission,
     QuestionRubric,
     QuestionScorecard,
+    RubricPointScore,
     Scorecard,
     TranscribedAnswer,
 )
@@ -409,6 +410,57 @@ def grade_questions_parallel(
 
 
 # ---------------------------------------------------------------------------
+# Unattempted sub-parts — score 0/max so the denominator is the whole exam
+# ---------------------------------------------------------------------------
+
+def build_unattempted_scorecards(
+    rubric_by_qid: dict[str, QuestionRubric],
+    missing_qids: list[str],
+    *,
+    mark_review: bool = True,
+) -> list[QuestionScorecard]:
+    """Synthesize 0/max scorecards for rubric sub-parts that have no answer.
+
+    A sub-part present in the rubric but absent from the OCR'd answers is
+    either a genuine blank or an OCR/segmentation miss. Either way it counts
+    against the full-exam denominator, so we emit a QuestionScorecard worth
+    0/max with one denied point per rubric point. With ``mark_review`` set,
+    each point is flagged for human review so an OCR drop is visible rather
+    than silently scored zero.
+    """
+    cards: list[QuestionScorecard] = []
+    for qid in missing_qids:
+        qr = rubric_by_qid.get(qid)
+        if qr is None:
+            continue
+        point_scores = [
+            RubricPointScore(
+                point_id=p.point_id,
+                awarded=False,
+                points_earned=0.0,
+                rationale=(
+                    "No answer was transcribed for this sub-part "
+                    "(blank or missed by OCR), so it earns no credit."
+                ),
+                transcript_evidence="",
+                grading_confidence="high",
+                review_recommended=mark_review,
+            )
+            for p in qr.rubric_points
+        ]
+        cards.append(
+            QuestionScorecard(
+                question_id=qid,
+                points_earned=0.0,
+                points_possible=qr.max_points,
+                point_scores=point_scores,
+                transcript_used="",
+            )
+        )
+    return cards
+
+
+# ---------------------------------------------------------------------------
 # HTML report — answer pages side-by-side with graded points + evidence
 # ---------------------------------------------------------------------------
 
@@ -516,6 +568,21 @@ header.report-head .meta { color: var(--muted); font-size: 14px; }
 .no-answer { color: var(--muted); font-style: italic; padding: 24px; text-align: center;
   border: 1px dashed var(--border); border-radius: 12px; }
 footer.report-foot { margin-top: 40px; color: var(--muted); font-size: 12px; text-align: center; }
+
+.unattempted-block { margin: 0 0 36px; }
+.unattempted-title {
+  font-size: 13px; text-transform: uppercase; letter-spacing: 1.2px;
+  color: var(--bad); border-bottom: 1px solid var(--border);
+  padding-bottom: 8px; margin-bottom: 12px;
+}
+.unattempted-note { color: var(--muted); margin: 0 0 16px; max-width: 980px; }
+.unattempted-note strong { color: var(--text); }
+.qcard.unattempted-card { border-color: var(--bad); }
+.qcard.unattempted-card .qcard-head { background: var(--bad-bg); }
+.unattempted-card .ua-note {
+  margin: 0; padding: 10px 18px; color: var(--muted); font-size: 13px;
+  background: #11141a; border-bottom: 1px solid var(--border);
+}
 """
 
 
@@ -591,6 +658,18 @@ def render_html_report(
           <div class="points">{points_html}</div>
         </div>"""
 
+    def render_unattempted_qcard(qs) -> str:
+        points_html = "".join(render_point(ps) for ps in qs.point_scores)
+        return f"""
+        <div class="qcard unattempted-card">
+          <div class="qcard-head">
+            <span class="qid">Q {esc(qs.question_id)} <span class="tag review">unattempted</span></span>
+            <span class="qscore">0 / {qs.points_possible:g}</span>
+          </div>
+          <div class="ua-note">No answer was transcribed — scored 0 / {qs.points_possible:g}.</div>
+          <div class="points">{points_html}</div>
+        </div>"""
+
     blocks = []
     for pi, img in enumerate(answer_images, start=1):
         data_uri = _img_to_data_uri(img)
@@ -613,6 +692,29 @@ def render_html_report(
         <div class="flags"><strong>⚠️ Review recommended</strong>
           <ul>{items}</ul></div>"""
 
+    # Sub-parts that have a scorecard but no transcribed answer are the 0/max
+    # "unattempted" ones; they belong to no answer page, so they get their own
+    # section that explicitly names them and shows each rubric point as 0.
+    answered_qids = {a.question_id for a in submission.answers}
+    unattempted = [qs for qs in scorecard.questions if qs.question_id not in answered_qids]
+    unattempted_html = ""
+    if unattempted:
+        ids = ", ".join(esc(qs.question_id) for qs in unattempted)
+        zero_pts = sum(qs.points_possible for qs in unattempted)
+        cards = "".join(render_unattempted_qcard(qs) for qs in unattempted)
+        unattempted_html = f"""
+        <section class="unattempted-block">
+          <div class="unattempted-title">Unattempted — scored 0</div>
+          <p class="unattempted-note">
+            No answer was transcribed for <strong>{ids}</strong>
+            ({len(unattempted)} sub-part(s)), so the student earned
+            <strong>0 / {zero_pts:g}</strong> on these parts — they still count
+            toward the total. If OCR may have missed an answer, double-check the
+            answer pages.
+          </p>
+          <div class="answers-col">{cards}</div>
+        </section>"""
+
     set_str = f" · {esc(scorecard.set_label)}" if scorecard.set_label else ""
     pct = scorecard.percentage
 
@@ -634,6 +736,7 @@ def render_html_report(
     </div>
   </header>
   {flags_html}
+  {unattempted_html}
   {''.join(blocks)}
   <footer class="report-foot">AP FRQ Auto-Grader · per-rubric-point evidence shown beside each answer page</footer>
 </div></body></html>"""

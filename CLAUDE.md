@@ -8,8 +8,9 @@ A Jupyter-notebook AP free-response auto-grader. It OCRs a student's scanned
 handwritten exam answers, parses the official marking-scheme PDF into a
 structured rubric, grades each answer against that rubric, and emits a
 self-contained HTML scorecard with per-rubric-point evidence and reasoning.
-Single-vendor stack: **Gemini 2.5 Pro** does OCR, rubric extraction, and
-grading — all via structured output (Pydantic `response_schema`).
+Single-vendor stack (Google Gemini 3.x): **Gemini 3.1 Pro** does handwriting
+OCR and **Gemini 3.5 Flash** does rubric extraction and grading — all via
+structured output (Pydantic `response_schema`).
 
 ## Commands
 
