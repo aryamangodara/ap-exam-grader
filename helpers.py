@@ -14,6 +14,7 @@ import base64
 import html
 import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 
@@ -294,6 +295,105 @@ def grade_question(
             ps.review_recommended = True
 
     return parsed  # type: ignore[return-value]
+
+
+def grade_questions_parallel(
+    client: genai.Client,
+    qids: list[str],
+    rubric_by_qid: dict[str, QuestionRubric],
+    answer_by_qid: dict[str, TranscribedAnswer],
+    *,
+    subject: str,
+    prompt_path: Path,
+    subject_addendum: str = "",
+    model: str = "gemini-2.5-pro",
+    low_confidence_threshold: float = 0.75,
+    max_workers: int = 8,
+    verbose: bool = False,
+) -> list[QuestionScorecard]:
+    """Grade many questions concurrently with a thread pool.
+
+    Each `grade_question` call is an independent, I/O-bound Gemini request, so
+    running them on threads gives near-linear speedup over a sequential loop
+    without changing any per-question logic. Results are returned in the same
+    order as `qids`; any qid missing from the rubric or the answers is skipped
+    with a printed note (matching the previous sequential behaviour).
+    """
+    # Resolve the work list up front, preserving qid order and reporting skips.
+    work: list[tuple[str, QuestionRubric, TranscribedAnswer]] = []
+    for qid in qids:
+        qr = rubric_by_qid.get(qid)
+        ans = answer_by_qid.get(qid)
+        if qr is None:
+            print(f"Skipping {qid}: not in parsed rubric")
+            continue
+        if ans is None:
+            print(f"Skipping {qid}: no student answer found")
+            continue
+        work.append((qid, qr, ans))
+
+    if not work:
+        return []
+
+    import threading
+    import time as _time
+
+    t0 = _time.perf_counter()
+    timings: dict[str, tuple[float, float]] = {}  # qid -> (start, end) relative to t0
+
+    def _grade(item: tuple[str, QuestionRubric, TranscribedAnswer]):
+        qid, qr, ans = item
+        start = _time.perf_counter() - t0
+        qs = grade_question(
+            client=client,
+            question_rubric=qr,
+            answer=ans,
+            subject=subject,
+            prompt_path=prompt_path,
+            subject_addendum=subject_addendum,
+            model=model,
+            review_recommended=(ans.confidence < low_confidence_threshold),
+        )
+        end = _time.perf_counter() - t0
+        timings[qid] = (start, end)
+        if verbose:
+            print(f"  [{threading.current_thread().name}] Q{qid}: "
+                  f"start={start:5.1f}s end={end:5.1f}s ({end - start:4.1f}s)")
+        return qid, qs
+
+    results: dict[str, QuestionScorecard] = {}
+    workers = max(1, min(max_workers, len(work)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_grade, item): item[0] for item in work}
+        for fut in as_completed(futures):
+            qid = futures[fut]
+            try:
+                _, qs = fut.result()
+            except Exception as exc:  # surface which question failed
+                raise RuntimeError(f"Grading failed for Q{qid}: {exc}") from exc
+            results[qid] = qs
+
+    # --- Concurrency diagnostic -------------------------------------------
+    wall = _time.perf_counter() - t0
+    busy = sum(e - s for s, e in timings.values())
+    # Peak overlap: max number of requests in flight at any instant.
+    events = []
+    for s, e in timings.values():
+        events.append((s, 1))
+        events.append((e, -1))
+    events.sort()
+    cur = peak = 0
+    for _, delta in events:
+        cur += delta
+        peak = max(peak, cur)
+    print(f"\nConcurrency report: wall={wall:.1f}s | sum-of-calls={busy:.1f}s | "
+          f"speedup={busy / wall if wall else 0:.1f}x | peak in-flight={peak}/{workers}")
+    if peak <= 1:
+        print("  ⚠️ Requests ran one-at-a-time (no overlap). Likely server-side "
+              "rate-limiting on your Gemini tier — not a threading problem.")
+
+    # Return in the original qid order (as_completed yields out of order).
+    return [results[qid] for qid, _, _ in work]
 
 
 # ---------------------------------------------------------------------------
