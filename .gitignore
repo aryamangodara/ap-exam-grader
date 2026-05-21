@@ -1,5 +1,6 @@
 # Secrets
 .env
+.secrets/
 *service-account*.json
 *-credentials*.json
 

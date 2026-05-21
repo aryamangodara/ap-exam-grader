@@ -10,7 +10,11 @@ Phases 0-2 surface:
 """
 from __future__ import annotations
 
+import base64
+import html
 import os
+from collections import defaultdict
+from io import BytesIO
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -23,6 +27,7 @@ from schemas import (
     ParsedSubmission,
     QuestionRubric,
     QuestionScorecard,
+    Scorecard,
     TranscribedAnswer,
 )
 
@@ -207,6 +212,34 @@ def load_rubric(
 
 
 # ---------------------------------------------------------------------------
+# Rubric flattening — align rubric granularity with OCR answer granularity
+# ---------------------------------------------------------------------------
+
+def flatten_rubric_by_subpart(rubric: ParsedRubric) -> dict[str, QuestionRubric]:
+    """Regroup a ParsedRubric so each entry is a sub-part QuestionRubric.
+
+    Why: the parsed rubric's top-level QuestionRubrics are keyed at
+    question level ("1", "2", ...) but their rubric_points carry sub-part
+    ids ("1a", "1b", ...) — and OCR labels student answers at sub-part
+    granularity too. Matching at top level produces an empty intersection;
+    matching at sub-part level grades correctly.
+    """
+    result: dict[str, QuestionRubric] = {}
+    for q in rubric.questions:
+        groups: dict[str, list] = defaultdict(list)
+        for p in q.rubric_points:
+            groups[p.question_id].append(p)
+        for subpart_id, points in groups.items():
+            result[subpart_id] = QuestionRubric(
+                question_id=subpart_id,
+                prompt_summary=q.prompt_summary,
+                rubric_points=points,
+                max_points=sum(p.point_value for p in points),
+            )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Grading (Phase 2) — one rubric + one transcript -> QuestionScorecard
 # ---------------------------------------------------------------------------
 
@@ -261,6 +294,237 @@ def grade_question(
             ps.review_recommended = True
 
     return parsed  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# HTML report — answer pages side-by-side with graded points + evidence
+# ---------------------------------------------------------------------------
+
+def _img_to_data_uri(img: Image.Image, max_width: int = 1100, quality: int = 80) -> str:
+    """Encode a PIL image as a base64 JPEG data URI, downscaled for file size."""
+    im = img.convert("RGB")
+    if im.width > max_width:
+        ratio = max_width / im.width
+        im = im.resize((max_width, int(im.height * ratio)), Image.LANCZOS)
+    buf = BytesIO()
+    im.save(buf, format="JPEG", quality=quality, optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+_HTML_STYLE = """
+:root {
+  --bg: #0f1115; --panel: #181b22; --panel-2: #1f232c; --border: #2a2f3a;
+  --text: #e6e8eb; --muted: #9aa3b2; --accent: #6ea8fe;
+  --good: #2fbf71; --good-bg: rgba(47,191,113,.12);
+  --bad: #f0556b; --bad-bg: rgba(240,85,107,.10);
+  --warn: #f5b942; --warn-bg: rgba(245,185,66,.12);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.55; font-size: 15px;
+}
+.wrap { max-width: 1500px; margin: 0 auto; padding: 32px 24px 80px; }
+header.report-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 24px; flex-wrap: wrap; padding: 28px 32px; margin-bottom: 28px;
+  background: linear-gradient(135deg, #1d2330, #14171e);
+  border: 1px solid var(--border); border-radius: 18px;
+}
+header.report-head h1 { margin: 0 0 4px; font-size: 26px; letter-spacing: -.3px; }
+header.report-head .meta { color: var(--muted); font-size: 14px; }
+.score-badge { text-align: center; min-width: 150px; }
+.score-badge .pct { font-size: 46px; font-weight: 700; line-height: 1; letter-spacing: -1px; }
+.score-badge .frac { color: var(--muted); font-size: 14px; margin-top: 6px; }
+.bar { height: 9px; border-radius: 99px; background: var(--panel-2); overflow: hidden; margin-top: 12px; }
+.bar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--bad), var(--warn), var(--good)); }
+
+.flags {
+  border: 1px solid var(--warn); background: var(--warn-bg); color: #f7d489;
+  border-radius: 12px; padding: 14px 18px; margin-bottom: 28px;
+}
+.flags strong { color: var(--warn); }
+.flags ul { margin: 8px 0 0; padding-left: 20px; }
+
+.page-block {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+  gap: 24px; margin-bottom: 36px; align-items: start;
+}
+.page-block .page-title {
+  grid-column: 1 / -1; font-size: 13px; text-transform: uppercase;
+  letter-spacing: 1.2px; color: var(--muted); border-bottom: 1px solid var(--border);
+  padding-bottom: 8px; margin-bottom: 4px;
+}
+.page-img {
+  position: sticky; top: 20px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 14px; padding: 10px; overflow: hidden;
+}
+.page-img img { width: 100%; display: block; border-radius: 8px; }
+.answers-col { display: flex; flex-direction: column; gap: 18px; }
+
+.qcard { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
+.qcard-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 14px 18px; background: var(--panel-2); border-bottom: 1px solid var(--border);
+}
+.qcard-head .qid { font-weight: 700; font-size: 17px; }
+.qcard-head .qscore { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--accent); }
+.transcript {
+  margin: 0; padding: 12px 18px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12.5px; color: var(--muted); white-space: pre-wrap; word-break: break-word;
+  background: #11141a; border-bottom: 1px solid var(--border); max-height: 220px; overflow: auto;
+}
+.points { padding: 6px 0; }
+.point {
+  padding: 12px 18px; border-bottom: 1px solid var(--border);
+  display: grid; grid-template-columns: 26px 1fr; gap: 12px;
+}
+.point:last-child { border-bottom: none; }
+.point .icon { font-size: 18px; line-height: 1.4; }
+.point.awarded { background: var(--good-bg); }
+.point.denied  { background: var(--bad-bg); }
+.point .pid { font-weight: 600; }
+.point .pts { color: var(--muted); font-weight: 500; font-variant-numeric: tabular-nums; }
+.point .rationale { margin: 6px 0 0; }
+.point .evidence {
+  margin: 8px 0 0; padding: 8px 12px; border-left: 3px solid var(--accent);
+  background: #11141a; border-radius: 0 8px 8px 0; font-family: ui-monospace, Consolas, monospace;
+  font-size: 12.5px; color: #cdd6e4; white-space: pre-wrap; word-break: break-word;
+}
+.tag {
+  display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px;
+  border-radius: 99px; margin-left: 6px; vertical-align: middle;
+}
+.tag.high { background: var(--good-bg); color: var(--good); }
+.tag.medium { background: var(--warn-bg); color: var(--warn); }
+.tag.low { background: var(--bad-bg); color: var(--bad); }
+.tag.review { background: rgba(110,168,254,.14); color: var(--accent); }
+.no-answer { color: var(--muted); font-style: italic; padding: 24px; text-align: center;
+  border: 1px dashed var(--border); border-radius: 12px; }
+footer.report-foot { margin-top: 40px; color: var(--muted); font-size: 12px; text-align: center; }
+"""
+
+
+def render_html_report(
+    scorecard: Scorecard,
+    submission: ParsedSubmission,
+    answer_images: list[Image.Image],
+    *,
+    low_confidence_threshold: float = 0.75,
+) -> str:
+    """Build a self-contained HTML report.
+
+    Layout: one block per answer-PDF page. Left = the rendered page image
+    (sticky); right = every question mapped to that page with its rubric
+    points, each showing awarded/denied, points, rationale, and the exact
+    transcript evidence quote. Images are embedded as base64 so the file is
+    fully portable.
+    """
+    esc = html.escape
+    scorecards_by_qid = {qs.question_id: qs for qs in scorecard.questions}
+
+    # Map each page -> answers appearing on it (in OCR order)
+    page_to_answers: dict[int, list[TranscribedAnswer]] = defaultdict(list)
+    for ans in submission.answers:
+        for p in ans.source_pages:
+            page_to_answers[p].append(ans)
+
+    def conf_tag(conf: str) -> str:
+        return f'<span class="tag {esc(conf)}">{esc(conf)} confidence</span>'
+
+    def render_point(ps) -> str:
+        awarded = ps.awarded
+        cls = "awarded" if awarded else "denied"
+        icon = "✅" if awarded else "❌"
+        review = '<span class="tag review">review</span>' if ps.review_recommended else ""
+        evidence = (
+            f'<div class="evidence">{esc(ps.transcript_evidence)}</div>'
+            if ps.transcript_evidence else ""
+        )
+        return f"""
+        <div class="point {cls}">
+          <div class="icon">{icon}</div>
+          <div>
+            <span class="pid">{esc(ps.point_id)}</span>
+            <span class="pts">· {ps.points_earned:g} pt</span>
+            {conf_tag(ps.grading_confidence)}{review}
+            <div class="rationale">{esc(ps.rationale)}</div>
+            {evidence}
+          </div>
+        </div>"""
+
+    def render_qcard(ans: TranscribedAnswer) -> str:
+        qs = scorecards_by_qid.get(ans.question_id)
+        if qs is None:
+            return f"""
+            <div class="qcard">
+              <div class="qcard-head"><span class="qid">Q {esc(ans.question_id)}</span>
+                <span class="qscore">not graded</span></div>
+              <pre class="transcript">{esc(ans.transcript)}</pre>
+            </div>"""
+        points_html = "".join(render_point(ps) for ps in qs.point_scores)
+        ocr_flag = (
+            ' <span class="tag low">OCR ' f'{ans.confidence:.2f}</span>'
+            if ans.confidence < low_confidence_threshold else ""
+        )
+        return f"""
+        <div class="qcard">
+          <div class="qcard-head">
+            <span class="qid">Q {esc(qs.question_id)}{ocr_flag}</span>
+            <span class="qscore">{qs.points_earned:g} / {qs.points_possible:g}</span>
+          </div>
+          <pre class="transcript">{esc(qs.transcript_used or ans.transcript)}</pre>
+          <div class="points">{points_html}</div>
+        </div>"""
+
+    blocks = []
+    for pi, img in enumerate(answer_images, start=1):
+        data_uri = _img_to_data_uri(img)
+        answers_here = page_to_answers.get(pi, [])
+        if answers_here:
+            cards = "".join(render_qcard(a) for a in answers_here)
+        else:
+            cards = '<div class="no-answer">No answers were mapped to this page.</div>'
+        blocks.append(f"""
+        <section class="page-block">
+          <div class="page-title">Answer page {pi} of {len(answer_images)}</div>
+          <div class="page-img"><img src="{data_uri}" alt="Answer page {pi}"></div>
+          <div class="answers-col">{cards}</div>
+        </section>""")
+
+    flags_html = ""
+    if scorecard.review_flags:
+        items = "".join(f"<li>{esc(f)}</li>" for f in scorecard.review_flags)
+        flags_html = f"""
+        <div class="flags"><strong>⚠️ Review recommended</strong>
+          <ul>{items}</ul></div>"""
+
+    set_str = f" · {esc(scorecard.set_label)}" if scorecard.set_label else ""
+    pct = scorecard.percentage
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scorecard — {esc(scorecard.subject)} {scorecard.year}</title>
+<style>{_HTML_STYLE}</style></head>
+<body><div class="wrap">
+  <header class="report-head">
+    <div>
+      <h1>{esc(scorecard.subject)} {scorecard.year}{set_str}</h1>
+      <div class="meta">Generated {esc(scorecard.generated_at)} · {len(scorecard.questions)} questions graded</div>
+    </div>
+    <div class="score-badge">
+      <div class="pct">{pct:.0f}%</div>
+      <div class="frac">{scorecard.total_points_earned:g} / {scorecard.total_points_possible:g} pts</div>
+      <div class="bar"><i style="width:{max(0, min(100, pct)):.1f}%"></i></div>
+    </div>
+  </header>
+  {flags_html}
+  {''.join(blocks)}
+  <footer class="report-foot">AP FRQ Auto-Grader · per-rubric-point evidence shown beside each answer page</footer>
+</div></body></html>"""
 
 
 # ---------------------------------------------------------------------------
