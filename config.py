@@ -14,6 +14,7 @@ SUBJECT_SLUG: dict[str, str] = {
     "AP Precalculus":                          "precalculus",
     "AP Physics C: Mechanics":                 "physics-c-mechanics",
     "AP Physics C: Electricity and Magnetism": "physics-c-em",
+    "AP Chemistry":                            "chemistry",
     "AP Environmental Science":                "environmental-science",
     "AP Microeconomics":                       "microeconomics",
     "AP Macroeconomics":                       "macroeconomics",
@@ -62,6 +63,18 @@ SUBJECT_GRADING_ADDENDA: dict[str, str] = {
         "Accept algebraically and calculus-equivalent expressions (including correct use "
         "of integrals/derivatives, Gauss's/Ampère's law, etc.) and correct symbolic "
         "answers. Require correct units and direction where the rubric specifies."
+    ),
+    "AP Chemistry": (
+        "FRQs are point-based; award each point independently. For calculations, "
+        "require the correct setup AND the final answer with appropriate units, and "
+        "apply follow-through (consequent) credit so an incorrect earlier value used "
+        "correctly downstream still earns later points. Accept answers within the "
+        "rubric's stated tolerance and do not over-penalize significant figures. "
+        "Explanation/justification points require correct particulate- or "
+        "molecular-level reasoning (intermolecular forces, Coulombic attraction, "
+        "collision theory, etc.) tied to the prompt — a correct answer with no valid "
+        "reasoning earns no reasoning point. Require balanced equations and correct "
+        "chemical formulas where the rubric specifies."
     ),
     "AP Environmental Science": (
         "FRQs are point-based and reward specificity. Vague or generic statements earn no "
