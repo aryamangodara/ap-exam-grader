@@ -13,6 +13,8 @@ from __future__ import annotations
 import base64
 import html
 import os
+import random
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -63,17 +65,24 @@ def render_pdf_to_images(pdf_path: Path, dpi: int = 300) -> list[Image.Image]:
 # Gemini client — auto-detect AI Studio vs Vertex AI
 # ---------------------------------------------------------------------------
 
-def get_gemini_client() -> genai.Client:
+def get_gemini_client(timeout_ms: int = 300_000) -> genai.Client:
     """Build a Gemini client. Prefers GEMINI_API_KEY (AI Studio); falls back to Vertex.
+
+    `timeout_ms` is the per-request HTTP timeout in milliseconds (google-genai
+    measures timeouts in ms; the SDK default is no explicit timeout). The
+    5-minute default comfortably covers a heavy Pro-model OCR call so it isn't
+    cancelled mid-flight; pair it with `generate_with_retry` for transient
+    499/503 blips.
 
     Vertex AI mode requires:
         GOOGLE_APPLICATION_CREDENTIALS  → path to service-account JSON on disk
         GOOGLE_CLOUD_PROJECT            → GCP project ID
         GOOGLE_CLOUD_LOCATION           → optional, defaults to us-central1
     """
+    http_options = types.HttpOptions(timeout=timeout_ms)
     api_key = os.environ.get("GEMINI_API_KEY")
     if api_key:
-        return genai.Client(api_key=api_key)
+        return genai.Client(api_key=api_key, http_options=http_options)
 
     if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
         project = os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -85,7 +94,8 @@ def get_gemini_client() -> genai.Client:
         # Gemini 3.x is served from the "global" endpoint on Vertex AI; regional
         # endpoints like us-central1 return 404 for these models.
         location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-        return genai.Client(vertexai=True, project=project, location=location)
+        return genai.Client(vertexai=True, project=project, location=location,
+                            http_options=http_options)
 
     raise RuntimeError(
         "No Gemini credentials found. In Grader/.env set either:\n"
@@ -94,6 +104,60 @@ def get_gemini_client() -> genai.Client:
         "  GOOGLE_APPLICATION_CREDENTIALS=C:/path/to/sa.json   (Vertex AI)\n"
         "  GOOGLE_CLOUD_PROJECT=<your-gcp-project-id>\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# Transient-error retry around Gemini calls
+# ---------------------------------------------------------------------------
+
+# Worth retrying: rate limits, 5xx server errors, and the mid-flight
+# cancellations (499 CANCELLED / DEADLINE_EXCEEDED) seen on the preview models.
+_RETRYABLE_CODES = {408, 429, 499, 500, 502, 503, 504}
+_RETRYABLE_STATUSES = {
+    "CANCELLED", "UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL",
+    "RESOURCE_EXHAUSTED", "ABORTED",
+}
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True if `exc` looks like a transient Gemini API error worth retrying."""
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    if isinstance(code, int) and code in _RETRYABLE_CODES:
+        return True
+    if isinstance(status, str) and status.upper() in _RETRYABLE_STATUSES:
+        return True
+    blob = str(exc).upper()
+    if any(s in blob for s in _RETRYABLE_STATUSES):
+        return True
+    return any(str(c) in blob for c in _RETRYABLE_CODES)
+
+
+def generate_with_retry(
+    client: genai.Client,
+    *,
+    max_attempts: int = 4,
+    base_delay: float = 2.0,
+    label: str = "",
+    **kwargs,
+):
+    """Call ``client.models.generate_content`` with retry on transient errors.
+
+    Retries 429/499/5xx and CANCELLED/UNAVAILABLE/DEADLINE_EXCEEDED with
+    exponential backoff + jitter. Non-transient errors (400 bad request, auth
+    failures, etc.) and the final attempt's error are raised immediately.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.models.generate_content(**kwargs)
+        except Exception as exc:
+            if attempt == max_attempts or not _is_transient(exc):
+                raise
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+            tag = f" [{label}]" if label else ""
+            print(f"    transient Gemini error{tag} (attempt {attempt}/{max_attempts}): {exc}")
+            print(f"    retrying in {delay:.1f}s...")
+            time.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +203,9 @@ def ocr_submission(
     if thinking_level:
         config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
 
-    response = client.models.generate_content(
+    response = generate_with_retry(
+        client,
+        label="OCR",
         model=model,
         contents=contents,
         config=types.GenerateContentConfig(**config_kwargs),
@@ -198,7 +264,9 @@ def load_rubric(
         contents.append(f"[Marking scheme page {i}/{len(images)}]")
         contents.append(img)
 
-    response = client.models.generate_content(
+    response = generate_with_retry(
+        client,
+        label="rubric",
         model=model,
         contents=contents,
         config=types.GenerateContentConfig(
@@ -288,7 +356,9 @@ def grade_question(
         f"```\n{answer.transcript}\n```\n"
     )
 
-    response = client.models.generate_content(
+    response = generate_with_retry(
+        client,
+        label=f"grade {answer.question_id}",
         model=model,
         contents=[base_prompt, user_message],
         config=types.GenerateContentConfig(
