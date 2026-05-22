@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(git check-ignore *)",
+      "Bash(python -c \"import json; nb=json.load\\(open\\('grader.ipynb',encoding='utf-8'\\)\\); print\\('cells', len\\(nb['cells']\\), '| code', sum\\(1 for c in nb['cells'] if c['cell_type']=='code'\\)\\)\")",
+      "Bash(python _verify.py)",
+      "Bash(python -c \"import os;print\\('%.3f MB' % \\(os.path.getsize\\('grader.ipynb'\\)/1e6\\)\\)\")",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ]
+  }
+}
