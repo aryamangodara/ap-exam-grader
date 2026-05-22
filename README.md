@@ -6,7 +6,9 @@ and reasoning.
 
 The whole pipeline runs in a single Jupyter notebook on a single AI vendor
 (**Google Gemini 3.x**): Gemini 3.1 Pro handles the handwriting OCR, and
-Gemini 3.5 Flash handles the rubric extraction and the grading.
+Gemini 3.5 Flash handles the rubric extraction and the grading. Drop each
+exam's PDFs into a per-subject folder under `data/` and one "Run All" grades
+every folder, writing `out/<slug>_ai_scorecard.html` for each.
 
 ```
 questions.pdf ─┐
@@ -57,34 +59,37 @@ GEMINI_API_KEY=your-key-here
 # GOOGLE_CLOUD_LOCATION=us-central1
 ```
 
-Drop three PDFs into `data/`:
+Drop each exam's three PDFs into its subject folder under `data/` (one folder
+per exam, named with the subject slug from `config.py`):
 
 | File | What it is |
 |---|---|
-| `data/questions.pdf` | The typed exam questions (OCR context only — not transcribed) |
-| `data/answers.pdf` | The student's scanned handwritten responses (this gets transcribed) |
-| `data/marking-scheme.pdf` | The typed rubric / scoring guidelines |
+| `data/<slug>/questions.pdf` | The typed exam questions (OCR context only — not transcribed) |
+| `data/<slug>/answers.pdf` | The student's scanned handwritten responses (this gets transcribed) |
+| `data/<slug>/marking-scheme.pdf` | The typed rubric / scoring guidelines (filename matched loosely) |
+
+For example, AP Calculus BC goes in `data/calculus-bc/`. Every folder holding
+all three PDFs is graded.
 
 ## Usage
 
-Open `grader.ipynb`, set the `CONFIG` block near the top (subject, year,
-optional set, and which questions to grade), and **Run All**. Outputs land in
-`out/`:
+Open `grader.ipynb`, adjust the `CONFIG` block near the top if needed, and
+**Run All**. Every subject folder under `data/` that has all three PDFs is
+graded. For each, three artifacts land in `out/`:
 
-- `scorecard-<subject>-<year>.html` — the main report
-- `scorecard-<subject>-<year>.json` — the canonical machine-readable artifact
-- `scorecard-<subject>-<year>.md` — a plaintext summary
+- `<slug>_ai_scorecard.html` — the main report
+- `<slug>_ai_scorecard.json` — the canonical machine-readable artifact
+- `<slug>_ai_scorecard.md` — a plaintext summary
 
 ```python
 CONFIG = {
-    "subject":            "AP Calculus BC",
-    "year":               2024,
-    "set":                None,            # "Set 1" / "Set 2" / None
-    "questions":          "all",           # or ["1", "3"]
-    "questions_pdf":      Path("data/questions.pdf"),
-    "answers_pdf":        Path("data/answers.pdf"),
-    "marking_scheme_pdf": Path("data/marking-scheme.pdf"),
-    # ... models, DPI, output dir, confidence threshold
+    "data_dir":       Path("data/"),  # scanned for data/<slug>/ exam folders
+    "only_subjects":  None,           # e.g. ["calculus-bc"] to grade one; None = all
+    "year":           2024,
+    "set":            None,           # "Set 1" / "Set 2" / None
+    "questions":      "all",          # or a list of sub-part ids: ["1a", "3b"]
+    "output_dir":     Path("out/"),
+    # ... models, DPI, thinking level, concurrency, confidence threshold
 }
 ```
 
@@ -92,12 +97,14 @@ CONFIG = {
 
 | Stage | Function (`helpers.py`) | Notes |
 |---|---|---|
+| Discover folders | `discover_exam_folders` | Finds `data/<slug>/` folders with a full PDF set; skips empty/incomplete |
+| Grade one exam | `grade_exam` | Runs the four phases below for one folder, returns a `Scorecard` |
 | PDF → images | `render_pdf_to_images` | PyMuPDF; 300 DPI for handwriting, 200 for typed rubric |
 | OCR | `ocr_submission` | Question + answer PDFs in one call → `ParsedSubmission` |
 | Rubric parse | `load_rubric` | Cached as `{pdf}.parsed.json`; `force_reparse=True` to refresh |
 | Align granularity | `flatten_rubric_by_subpart` | Regroups rubric to sub-part keys so they match the OCR answer keys |
-| Grade | `grade_question` | One call per question → `QuestionScorecard` |
-| Render | `render_html_report` | Answer pages beside graded points + evidence |
+| Grade | `grade_questions_parallel` | One call per question (threaded) → `QuestionScorecard`; blanks scored 0/max |
+| Render | `render_html_report` | Answer pages beside graded points + evidence, plus an Unattempted section |
 
 All Pydantic models live in `schemas.py` and double as Gemini
 `response_schema`s. Prompts are plain text in `prompts/` and are read at call
@@ -141,14 +148,13 @@ subject-specific scoring conventions live.
 ## Project layout
 
 ```
-grader.ipynb     main notebook (orchestration)
+grader.ipynb     main notebook (discovers data/<slug>/ folders, grades each)
 config.py        subject slugs + per-subject grading addenda
 schemas.py       Pydantic models (also Gemini response schemas)
-helpers.py       PDF render, Gemini client, OCR, rubric parse, grading, HTML report
+helpers.py       discovery, Gemini client, OCR, rubric parse, grading, HTML report
 prompts/         ocr.txt, rubric_extract.txt, grade_question.txt
-data/            your input PDFs (gitignored)
-rubrics/         optional rubric library (gitignored)
-out/             generated scorecards (gitignored)
+data/<slug>/     each exam's input PDFs, e.g. data/calculus-bc/ (gitignored)
+out/             generated <slug>_ai_scorecard.{html,json,md} (gitignored)
 ```
 
 See [CLAUDE.md](CLAUDE.md) for deeper architecture notes.

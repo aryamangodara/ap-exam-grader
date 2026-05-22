@@ -13,6 +13,8 @@ __pycache__/
 # All user-supplied PDFs (questions, answers, marking schemes)
 data/*.pdf
 data/*.PDF
+data/**/*.pdf
+data/**/*.PDF
 exams/**/*.pdf
 exams/**/*.PDF
 rubrics/*.pdf

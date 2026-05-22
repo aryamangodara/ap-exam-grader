@@ -31,10 +31,14 @@ There are no lint/build/test commands configured. `grader2.ipynb` and
   - `GEMINI_API_KEY=...` (AI Studio — preferred, simplest), **or**
   - `GOOGLE_APPLICATION_CREDENTIALS` + `GOOGLE_CLOUD_PROJECT` (Vertex AI).
   - `get_gemini_client()` prefers the API key and falls back to Vertex.
-- Three PDFs in `data/` (all gitignored):
+- One sub-folder per exam under `data/`, named with the subject **slug**
+  (e.g. `data/calculus-bc/`), each holding three PDFs (all gitignored):
   - `questions.pdf` — typed exam questions (OCR **context only**, not transcribed)
   - `answers.pdf` — student's scanned handwriting (this is what gets transcribed)
-  - `marking-scheme.pdf` — typed rubric / model answers
+  - `marking-scheme.pdf` — typed rubric / model answers (filename matched loosely)
+
+  Every folder with all three PDFs is discovered and graded in one "Run All";
+  each writes `out/<slug>_ai_scorecard.{html,json,md}`.
 
 ## Architecture & data flow
 
@@ -46,11 +50,17 @@ config.py    SUBJECT_SLUG, SUBJECT_GRADING_ADDENDA, rubric_filename()
 schemas.py   all Pydantic models (also serve as Gemini response_schema)
 helpers.py   render_pdf_to_images, get_gemini_client, ocr_submission,
              load_rubric, flatten_rubric_by_subpart, grade_question,
+             grade_questions_parallel, build_unattempted_scorecards,
+             discover_exam_folders, grade_exam, assemble_scorecard,
              render_html_report, character_error_rate
 prompts/     ocr.txt, rubric_extract.txt, grade_question.txt  (editable, read at call time)
 ```
 
-Pipeline (notebook cell order):
+Pipeline: the notebook calls `discover_exam_folders(data/)` to find every
+subject folder with a full PDF set, then loops calling `grade_exam(...)` per
+folder (a folder that errors is reported and skipped, not fatal). `grade_exam`
+runs these four phases and returns a `Scorecard` plus the
+`submission`/`answer_images` needed to render:
 
 1. **OCR** (`ocr_submission`): question + answer images go in **one** Gemini
    call so it labels each transcript with the canonical question IDs from the
@@ -60,12 +70,15 @@ Pipeline (notebook cell order):
    `ParsedRubric`, cached as a `{pdf}.parsed.json` **sidecar** next to the PDF.
    Subsequent runs read the sidecar and skip Gemini. Force a fresh parse by
    deleting the sidecar or passing `force_reparse=True`.
-3. **Grade** (`grade_question`, one call per question, `temperature=0`): emits
-   `QuestionScorecard` with per-point awarded/denied, quoted
-   `transcript_evidence`, and `grading_confidence`.
+3. **Grade** (`grade_questions_parallel` → `grade_question`, one call per
+   question, `temperature=0`): emits `QuestionScorecard` with per-point
+   awarded/denied, quoted `transcript_evidence`, and `grading_confidence`.
+   Rubric sub-parts with no transcribed answer are scored 0/max via
+   `build_unattempted_scorecards`, then `assemble_scorecard` totals everything.
 4. **Render** (`render_html_report`): self-contained HTML — answer page image
    (base64-embedded) on the left, graded rubric points with evidence on the
-   right. Also writes `.json` and a slim `.md` to `out/`.
+   right, plus an "Unattempted" section for the 0/max sub-parts. The notebook
+   writes `out/<slug>_ai_scorecard.{html,json,md}`.
 
 ### The critical granularity invariant
 
@@ -74,18 +87,21 @@ The parsed rubric's top-level `QuestionRubric`s are keyed at **question** level
 `"1b"`), and OCR labels answers at sub-part granularity too. Matching answers
 to the rubric at the top level yields an **empty intersection → 0/0 score**.
 `flatten_rubric_by_subpart()` regroups the rubric to sub-part granularity so
-the keys line up. The grade-all cell prints a diagnostic (rubric sub-parts /
-answer sub-parts / intersection) and raises if the intersection is empty —
-this is the first thing to check when a score looks wrong. Only the
-intersection of `(rubric sub-parts ∩ answer sub-parts)` is graded.
+the keys line up. `grade_exam` grades the intersection of `(rubric sub-parts ∩
+answer sub-parts)`, scores rubric-only sub-parts 0/max, and raises if the
+overlap is empty — that empty-overlap error is the first thing to check when a
+score looks wrong (usually a question-ID formatting mismatch).
 
 ## Conventions specific to this repo
 
-- **Editing the notebook:** use `NotebookEdit` (not `Edit`). You must `Read`
-  the notebook first, and because `%autoreload 2` is on, re-`Read` after each
-  edit before the next one. The `.ipynb` is ~28 MB because answer-page images
-  are embedded in cell outputs — dump cell *sources* with a small Python script
-  rather than reading the whole file when you only need the code.
+- **Editing the notebook:** the `.ipynb` is large because answer-page images
+  are embedded in cell outputs, and `NotebookEdit`/`Read` both pull all of that
+  into context. Instead, edit cell *sources* with a small Python script that
+  loads the JSON, replaces the target cell's `source` (write new code to a
+  `.txt` first to avoid `\n`-escaping hazards in f-strings), and writes back
+  with `json.dump(..., indent=1, ensure_ascii=True)` + a trailing newline so
+  untouched cells stay byte-identical. The `nbstripout` git filter strips
+  outputs on commit, so the committed diff shows only source changes.
 - **Subject extensibility:** the grader is subject-agnostic. To add a subject,
   extend `SUBJECT_SLUG` and (optionally) `SUBJECT_GRADING_ADDENDA` in
   `config.py`. The addendum text is injected into the grading prompt verbatim;
@@ -102,5 +118,5 @@ intersection of `(rubric sub-parts ∩ answer sub-parts)` is graded.
   `CONFIG["low_confidence_threshold"]` (default 0.75) flags every point with
   `review_recommended`, and low per-point `grading_confidence` adds a
   `review_flags` banner item in the report.
-- **Never commit** `data/*.pdf`, `rubrics/*.pdf`, `*.parsed.json`, `out/*`,
+- **Never commit** `data/**/*.pdf`, `rubrics/*.pdf`, `*.parsed.json`, `out/*`,
   `.env`, or anything under `.secrets/` — all gitignored.

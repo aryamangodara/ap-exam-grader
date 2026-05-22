@@ -15,6 +15,7 @@ import html
 import os
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -740,6 +741,198 @@ def render_html_report(
   {''.join(blocks)}
   <footer class="report-foot">AP FRQ Auto-Grader · per-rubric-point evidence shown beside each answer page</footer>
 </div></body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# Batch orchestration — discover subject folders and grade each end-to-end
+# ---------------------------------------------------------------------------
+
+def _find_pdf(folder: Path, *keywords: str) -> Path | None:
+    """First PDF in `folder` whose filename stem contains all keywords (case-insensitive)."""
+    pdfs = sorted(folder.glob("*.pdf")) + sorted(folder.glob("*.PDF"))
+    for p in pdfs:
+        stem = p.stem.lower()
+        if all(k in stem for k in keywords):
+            return p
+    return None
+
+
+def discover_exam_folders(
+    data_dir: Path,
+    slug_to_subject: dict[str, str],
+    *,
+    only_slugs: list[str] | None = None,
+) -> tuple[list[dict], list[str]]:
+    """Find subject sub-folders under ``data_dir`` that hold a full exam.
+
+    A folder qualifies if it contains a questions PDF, an answers PDF and a
+    marking-scheme PDF. Files are matched loosely by filename keyword, so
+    ``marking scheme.pdf`` and ``marking-scheme.pdf`` both work. Returns
+    ``(exams, notes)``: each exam is a dict with the resolved paths, the folder
+    ``slug`` and its canonical ``subject``; ``notes`` holds human-readable
+    reasons folders were skipped (so nothing is dropped silently).
+    """
+    data_dir = Path(data_dir)
+    exams: list[dict] = []
+    notes: list[str] = []
+    for folder in sorted(p for p in data_dir.iterdir() if p.is_dir()):
+        slug = folder.name
+        if only_slugs and slug not in only_slugs:
+            continue
+        q = _find_pdf(folder, "question")
+        a = _find_pdf(folder, "answer")
+        m = _find_pdf(folder, "marking") or _find_pdf(folder, "scheme")
+        missing = [n for n, p in (("questions", q), ("answers", a), ("marking-scheme", m)) if p is None]
+        if len(missing) == 3:
+            continue  # empty scaffold folder — nothing to grade yet
+        if missing:
+            notes.append(f"{slug}: skipped — missing {', '.join(missing)} PDF(s)")
+            continue
+        subject = slug_to_subject.get(slug)
+        if subject is None:
+            notes.append(f"{slug}: skipped — folder name is not a known subject slug (see config.py)")
+            continue
+        exams.append({
+            "slug": slug,
+            "subject": subject,
+            "folder": folder,
+            "questions_pdf": q,
+            "answers_pdf": a,
+            "marking_scheme_pdf": m,
+        })
+    return exams, notes
+
+
+def assemble_scorecard(
+    *,
+    subject: str,
+    year: int,
+    set_label: str | None,
+    question_scorecards: list[QuestionScorecard],
+    missing_qids: list[str],
+    config_echo: dict | None = None,
+) -> Scorecard:
+    """Total per-question scorecards into a Scorecard, with review flags.
+
+    Flags cover unattempted (0/max) sub-parts, questions whose OCR confidence
+    fell below threshold, and any point graded with low confidence.
+    """
+    total_earned = sum(qs.points_earned for qs in question_scorecards)
+    total_possible = sum(qs.points_possible for qs in question_scorecards)
+    percentage = (total_earned / total_possible * 100.0) if total_possible else 0.0
+
+    missing_set = set(missing_qids)
+    review_flags: list[str] = []
+    for qs in question_scorecards:
+        if qs.question_id in missing_set:
+            review_flags.append(
+                f"Q{qs.question_id}: no answer transcribed — scored 0/max; verify it was truly left blank"
+            )
+            continue
+        if any(ps.review_recommended for ps in qs.point_scores):
+            review_flags.append(f"Q{qs.question_id}: OCR confidence below threshold — verify transcript")
+        if any(ps.grading_confidence == "low" for ps in qs.point_scores):
+            review_flags.append(f"Q{qs.question_id}: one or more rubric points scored with low confidence")
+
+    return Scorecard(
+        subject=subject,
+        year=year,
+        set_label=set_label,
+        total_points_earned=total_earned,
+        total_points_possible=total_possible,
+        percentage=percentage,
+        questions=question_scorecards,
+        review_flags=review_flags,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        config_echo=config_echo or {},
+    )
+
+
+def grade_exam(
+    client: genai.Client,
+    *,
+    subject: str,
+    year: int,
+    set_label: str | None,
+    questions_pdf: Path,
+    answers_pdf: Path,
+    marking_scheme_pdf: Path,
+    ocr_prompt_path: Path,
+    rubric_prompt_path: Path,
+    grade_prompt_path: Path,
+    subject_addendum: str = "",
+    model_ocr: str = "gemini-3.1-pro-preview",
+    model_rubric: str = "gemini-3.5-flash",
+    model_grading: str = "gemini-3.5-flash",
+    ocr_dpi: int = 300,
+    rubric_dpi: int = 200,
+    ocr_thinking_level: str | None = "low",
+    grading_max_workers: int = 8,
+    low_confidence_threshold: float = 0.75,
+    questions: list[str] | str = "all",
+    config_echo: dict | None = None,
+) -> dict:
+    """Run the full OCR -> rubric -> grade -> assemble pipeline for one exam.
+
+    Returns a dict with: ``scorecard``, ``submission``, ``answer_images``,
+    ``rubric``, ``qids_to_grade`` and ``missing_qids``. Pass ``submission`` and
+    ``answer_images`` straight to :func:`render_html_report` to build the HTML.
+    Unattempted sub-parts (in the rubric but not transcribed) are scored 0/max.
+    """
+    question_images = render_pdf_to_images(questions_pdf, dpi=ocr_dpi)
+    answer_images = render_pdf_to_images(answers_pdf, dpi=ocr_dpi)
+
+    submission = ocr_submission(
+        client, question_images, answer_images, ocr_prompt_path,
+        model=model_ocr, thinking_level=ocr_thinking_level,
+    )
+
+    rubric = load_rubric(
+        client, marking_scheme_pdf,
+        subject=subject, year=year, set_label=set_label,
+        prompt_path=rubric_prompt_path, model=model_rubric, dpi=rubric_dpi,
+    )
+
+    rubric_by_qid = flatten_rubric_by_subpart(rubric)
+    answer_by_qid = {a.question_id: a for a in submission.answers}
+
+    if questions == "all":
+        universe = set(rubric_by_qid)
+    else:
+        universe = set(questions) & set(rubric_by_qid)
+    if not universe:
+        raise RuntimeError(
+            f"No questions to grade for {subject!r}. "
+            f"Rubric sub-parts: {sorted(rubric_by_qid)}; "
+            f"answer sub-parts: {sorted(answer_by_qid)}; requested: {questions}."
+        )
+
+    qids_to_grade = sorted(universe & set(answer_by_qid))
+    missing_qids = sorted(universe - set(answer_by_qid))
+
+    question_scorecards = grade_questions_parallel(
+        client, qids_to_grade, rubric_by_qid, answer_by_qid,
+        subject=subject, prompt_path=grade_prompt_path,
+        subject_addendum=subject_addendum, model=model_grading,
+        low_confidence_threshold=low_confidence_threshold,
+        max_workers=grading_max_workers,
+    )
+    question_scorecards += build_unattempted_scorecards(rubric_by_qid, missing_qids)
+    question_scorecards.sort(key=lambda qs: qs.question_id)
+
+    scorecard = assemble_scorecard(
+        subject=subject, year=year, set_label=set_label,
+        question_scorecards=question_scorecards, missing_qids=missing_qids,
+        config_echo=config_echo,
+    )
+    return {
+        "scorecard": scorecard,
+        "submission": submission,
+        "answer_images": answer_images,
+        "rubric": rubric,
+        "qids_to_grade": qids_to_grade,
+        "missing_qids": missing_qids,
+    }
 
 
 # ---------------------------------------------------------------------------
