@@ -445,6 +445,7 @@ def grade_questions_parallel(
     low_confidence_threshold: float = 0.75,
     max_workers: int = 8,
     verbose: bool = False,
+    force_review_qids: set[str] | None = None,
 ) -> list[QuestionScorecard]:
     """Grade many questions concurrently with a thread pool.
 
@@ -453,7 +454,13 @@ def grade_questions_parallel(
     without changing any per-question logic. Results are returned in the same
     order as `qids`; any qid missing from the rubric or the answers is skipped
     with a printed note (matching the previous sequential behaviour).
+
+    ``force_review_qids`` flags every rubric point of those qids for human
+    review regardless of OCR confidence — used for sub-parts whose transcript
+    was recovered from a parent-level OCR block (see
+    ``_synthesize_subpart_answers_from_parents``).
     """
+    force_review = force_review_qids or set()
     # Resolve the work list up front, preserving qid order and reporting skips.
     work: list[tuple[str, QuestionRubric, TranscribedAnswer]] = []
     for qid in qids:
@@ -487,7 +494,9 @@ def grade_questions_parallel(
             prompt_path=prompt_path,
             subject_addendum=subject_addendum,
             model=model,
-            review_recommended=(ans.confidence < low_confidence_threshold),
+            review_recommended=(
+                qid in force_review or ans.confidence < low_confidence_threshold
+            ),
         )
         end = _time.perf_counter() - t0
         timings[qid] = (start, end)
@@ -529,6 +538,59 @@ def grade_questions_parallel(
 
     # Return in the original qid order (as_completed yields out of order).
     return [results[qid] for qid, _, _ in work]
+
+
+# ---------------------------------------------------------------------------
+# Sub-part recovery — rescue parent-level OCR blocks for sub-part rubrics
+# ---------------------------------------------------------------------------
+
+def _synthesize_subpart_answers_from_parents(
+    answer_by_qid: dict[str, TranscribedAnswer],
+    missing_qids: list[str],
+) -> tuple[dict[str, TranscribedAnswer], list[str], list[str]]:
+    """Recover sub-part answers from a parent-level transcript.
+
+    If the OCR pass labeled a continuous unlabeled response with the parent
+    question id (e.g. ``"4"`` because the student wrote one block addressing
+    4a–4d without writing the sub-part labels themselves), every sub-part
+    missing an explicit answer is given a copy of that parent transcript so
+    the grader can locate per-rubric-point evidence inside the same block.
+    Without this rescue, every such sub-part is silently scored 0/max via
+    :func:`build_unattempted_scorecards` even though the student did write a
+    response — the original bug this guards against.
+
+    Matching rule: for each missing sub-part ``X``, the **longest existing**
+    OCR'd question id that is a strict prefix of ``X`` wins (so ``"1b"`` is
+    preferred over ``"1"`` when both exist for a sub-part like ``"1b-ii"``).
+
+    Returns ``(updated_answer_by_qid, still_missing, recovered_qids)``.
+    ``recovered_qids`` is the list of sub-parts we filled in — callers should
+    flag those for human review (the per-sub-part attribution came from the
+    grader rather than from explicit student labels).
+    """
+    updated = dict(answer_by_qid)
+    recovered: list[str] = []
+    still_missing: list[str] = []
+    # Sort candidate parents longest-first so the most specific prefix wins.
+    candidates = sorted(updated, key=len, reverse=True)
+    for sub in missing_qids:
+        parent = next(
+            (c for c in candidates if c != sub and sub.startswith(c)),
+            None,
+        )
+        if parent is None:
+            still_missing.append(sub)
+            continue
+        parent_ans = updated[parent]
+        updated[sub] = TranscribedAnswer(
+            question_id=sub,
+            transcript=parent_ans.transcript,
+            source_pages=list(parent_ans.source_pages),
+            confidence=parent_ans.confidence,
+            low_confidence_snippets=list(parent_ans.low_confidence_snippets),
+        )
+        recovered.append(sub)
+    return updated, still_missing, recovered
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +776,7 @@ def render_html_report(
     answer_images: list[Image.Image],
     *,
     low_confidence_threshold: float = 0.75,
+    recovered_qids: list[str] | None = None,
 ) -> str:
     """Build a self-contained HTML report.
 
@@ -722,13 +785,60 @@ def render_html_report(
     points, each showing awarded/denied, points, rationale, and the exact
     transcript evidence quote. Images are embedded as base64 so the file is
     fully portable.
+
+    ``recovered_qids`` lists sub-parts whose transcript was recovered from a
+    parent-level OCR block (the student wrote one continuous unlabeled
+    response to a multi-part question). They are rendered alongside the
+    parent's answer pages — not in the Unattempted section — with a
+    "shared transcript" tag, since each sub-part was graded against the same
+    parent transcript. The parent's own (now redundant) "not graded" card is
+    suppressed in favour of its children.
     """
     esc = html.escape
     scorecards_by_qid = {qs.question_id: qs for qs in scorecard.questions}
+    ocr_by_qid = {a.question_id: a for a in submission.answers}
+    recovered_list = list(recovered_qids or [])  # preserve caller order for stable card order
+    recovered_set = set(recovered_list)
 
-    # Map each page -> answers appearing on it (in OCR order)
-    page_to_answers: dict[int, list[TranscribedAnswer]] = defaultdict(list)
+    # For each recovered sub-part, find its OCR parent so we can place the
+    # sub-part's qcard on the parent's pages and surface the parent transcript.
+    # Mirrors the longest-prefix rule in `_synthesize_subpart_answers_from_parents`.
+    def _parent_of(sub: str) -> str | None:
+        for cand in sorted(ocr_by_qid, key=len, reverse=True):
+            if cand != sub and sub.startswith(cand):
+                return cand
+        return None
+    # Build as a plain dict (insertion-ordered) so qcards render in the order
+    # the caller passed — typically the sorted sub-part order (4a, 4b, 4c, 4d).
+    recovered_parents: dict[str, str] = {}
+    for sub in recovered_list:
+        parent = _parent_of(sub)
+        if parent is not None:
+            recovered_parents[sub] = parent
+    parents_with_recovered_children = set(recovered_parents.values())
+
+    # Build the answer list we actually render: keep every OCR'd answer except
+    # parents whose children took their place, and synthesize one entry per
+    # recovered sub-part that inherits the parent's source_pages + transcript
+    # so the grading appears beside the page image the student wrote on.
+    augmented: list[TranscribedAnswer] = []
     for ans in submission.answers:
+        if ans.question_id in parents_with_recovered_children:
+            continue  # children render in its place — suppress the orphan card
+        augmented.append(ans)
+    for sub, parent in recovered_parents.items():
+        p_ans = ocr_by_qid[parent]
+        augmented.append(TranscribedAnswer(
+            question_id=sub,
+            transcript=p_ans.transcript,
+            confidence=p_ans.confidence,
+            source_pages=list(p_ans.source_pages),
+            low_confidence_snippets=list(p_ans.low_confidence_snippets),
+        ))
+
+    # Map each page -> answers appearing on it (OCR order, recovered last).
+    page_to_answers: dict[int, list[TranscribedAnswer]] = defaultdict(list)
+    for ans in augmented:
         for p in ans.source_pages:
             page_to_answers[p].append(ans)
 
@@ -770,10 +880,14 @@ def render_html_report(
             ' <span class="tag low">OCR ' f'{ans.confidence:.2f}</span>'
             if ans.confidence < low_confidence_threshold else ""
         )
+        shared_flag = (
+            ' <span class="tag review">shared transcript</span>'
+            if ans.question_id in recovered_set else ""
+        )
         return f"""
         <div class="qcard">
           <div class="qcard-head">
-            <span class="qid">Q {esc(qs.question_id)}{ocr_flag}</span>
+            <span class="qid">Q {esc(qs.question_id)}{ocr_flag}{shared_flag}</span>
             <span class="qscore">{qs.points_earned:g} / {qs.points_possible:g}</span>
           </div>
           <pre class="transcript">{esc(qs.transcript_used or ans.transcript)}</pre>
@@ -817,8 +931,11 @@ def render_html_report(
     # Sub-parts that have a scorecard but no transcribed answer are the 0/max
     # "unattempted" ones; they belong to no answer page, so they get their own
     # section that explicitly names them and shows each rubric point as 0.
-    answered_qids = {a.question_id for a in submission.answers}
-    unattempted = [qs for qs in scorecard.questions if qs.question_id not in answered_qids]
+    # Note: `rendered_qids` is built from `augmented`, not `submission.answers`,
+    # so recovered sub-parts (graded against a parent transcript) appear in the
+    # per-page section above and do NOT fall into Unattempted.
+    rendered_qids = {a.question_id for a in augmented}
+    unattempted = [qs for qs in scorecard.questions if qs.question_id not in rendered_qids]
     unattempted_html = ""
     if unattempted:
         ids = ", ".join(esc(qs.question_id) for qs in unattempted)
@@ -931,24 +1048,36 @@ def assemble_scorecard(
     set_label: str | None,
     question_scorecards: list[QuestionScorecard],
     missing_qids: list[str],
+    recovered_qids: list[str] | None = None,
     config_echo: dict | None = None,
 ) -> Scorecard:
     """Total per-question scorecards into a Scorecard, with review flags.
 
-    Flags cover unattempted (0/max) sub-parts, questions whose OCR confidence
-    fell below threshold, and any point graded with low confidence.
+    Flags cover unattempted (0/max) sub-parts, sub-parts whose transcript was
+    recovered from a parent-level OCR block (unlabeled multi-part response),
+    questions whose OCR confidence fell below threshold, and any point graded
+    with low confidence.
     """
     total_earned = sum(qs.points_earned for qs in question_scorecards)
     total_possible = sum(qs.points_possible for qs in question_scorecards)
     percentage = (total_earned / total_possible * 100.0) if total_possible else 0.0
 
     missing_set = set(missing_qids)
+    recovered_set = set(recovered_qids or [])
     review_flags: list[str] = []
     for qs in question_scorecards:
         if qs.question_id in missing_set:
             review_flags.append(
                 f"Q{qs.question_id}: no answer transcribed — scored 0/max; verify it was truly left blank"
             )
+            continue
+        if qs.question_id in recovered_set:
+            review_flags.append(
+                f"Q{qs.question_id}: student wrote an unlabeled response covering this and "
+                "sibling sub-parts; transcript reused from the parent question — verify the "
+                "grader attributed evidence to the right sub-part"
+            )
+            # Don't double-flag with the generic OCR / low-confidence messages.
             continue
         if any(ps.review_recommended for ps in qs.point_scores):
             review_flags.append(f"Q{qs.question_id}: OCR confidence below threshold — verify transcript")
@@ -1028,8 +1157,24 @@ def grade_exam(
             f"answer sub-parts: {sorted(answer_by_qid)}; requested: {questions}."
         )
 
+    # First pass: which rubric sub-parts have an explicit OCR'd answer?
+    initial_missing = sorted(universe - set(answer_by_qid))
+
+    # Rescue parent-level OCR blocks (e.g. student wrote one continuous answer
+    # to Q4 without labeling 4a/4b/4c/4d) by copying the parent transcript
+    # into each missing sub-part. Sub-parts genuinely not addressed remain in
+    # ``missing_qids`` and are scored 0/max as before.
+    answer_by_qid, still_missing, recovered_qids = (
+        _synthesize_subpart_answers_from_parents(answer_by_qid, initial_missing)
+    )
+    if recovered_qids:
+        print(
+            f"  Recovered {len(recovered_qids)} sub-part(s) from a parent-level "
+            f"OCR block: {', '.join(recovered_qids)}"
+        )
+
     qids_to_grade = sorted(universe & set(answer_by_qid))
-    missing_qids = sorted(universe - set(answer_by_qid))
+    missing_qids = sorted(set(still_missing) & universe)
 
     question_scorecards = grade_questions_parallel(
         client, qids_to_grade, rubric_by_qid, answer_by_qid,
@@ -1037,6 +1182,7 @@ def grade_exam(
         subject_addendum=subject_addendum, model=model_grading,
         low_confidence_threshold=low_confidence_threshold,
         max_workers=grading_max_workers,
+        force_review_qids=set(recovered_qids),
     )
     question_scorecards += build_unattempted_scorecards(rubric_by_qid, missing_qids)
     question_scorecards.sort(key=lambda qs: qs.question_id)
@@ -1044,6 +1190,7 @@ def grade_exam(
     scorecard = assemble_scorecard(
         subject=subject, year=year, set_label=set_label,
         question_scorecards=question_scorecards, missing_qids=missing_qids,
+        recovered_qids=recovered_qids,
         config_echo=config_echo,
     )
     return {
@@ -1053,6 +1200,7 @@ def grade_exam(
         "rubric": rubric,
         "qids_to_grade": qids_to_grade,
         "missing_qids": missing_qids,
+        "recovered_qids": recovered_qids,
     }
 
 

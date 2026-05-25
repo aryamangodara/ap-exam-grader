@@ -12,6 +12,8 @@ Your job:
 
 2. **Transcribe each student answer verbatim.** Match every transcribed answer to one of the canonical question IDs from step 1. Preserve punctuation, meaningful line breaks, and spelling errors — do NOT correct the student's content.
 
+   **Unlabeled multi-part responses.** If the student wrote a single continuous response that addresses multiple sub-parts of a question (e.g. covers 4a, 4b, 4c, 4d) but did NOT write the sub-part labels themselves and you cannot see clean visual boundaries between sub-parts, emit ONE `TranscribedAnswer` with `question_id` set to the **parent** question id (e.g. `"4"`, not `"4a"`). The grader knows how to evaluate a parent-level transcript against each sub-part's rubric. Do NOT invent sub-part boundaries that aren't actually on the page, and do NOT silently drop the response by labeling it under a single sub-part — that loses credit on the other sub-parts. Only emit sub-part-keyed answers (`"4a"`, `"4b"`, …) when the student themselves wrote the sub-part labels, OR there are visibly distinct answer blocks (separate paragraphs, ruled-off regions, etc.) that map cleanly to each sub-part.
+
 3. **Math in LaTeX.** Inline math in `$...$`, display math in `$$...$$`. Examples: `$x^2 + 3$`, `$\int_0^1 e^x\,dx$`, `$$\lim_{x\to 0}\frac{\sin x}{x} = 1$$`. Greek letters, derivatives, integrals, fractions, summations, limits — all in LaTeX.
 
 4. **Code in plain text.** For Java/Python/etc., preserve indentation and exact syntax. Do NOT wrap code in LaTeX.
