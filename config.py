@@ -12,6 +12,7 @@ SUBJECT_SLUG: dict[str, str] = {
     "AP Calculus AB":                          "calculus-ab",
     "AP Calculus BC":                          "calculus-bc",
     "AP Precalculus":                          "precalculus",
+    "AP Statistics":                           "statistics",
     "AP Physics C: Mechanics":                 "physics-c-mechanics",
     "AP Physics C: Electricity and Magnetism": "physics-c-em",
     "AP Chemistry":                            "chemistry",
@@ -46,6 +47,19 @@ SUBJECT_GRADING_ADDENDA: dict[str, str] = {
         "Apply follow-through: an arithmetic or sign error costs only the point where it "
         "occurs, and downstream points may still be earned. Where the rubric asks for "
         "justification or reasoning, a bare final answer does not earn the reasoning point."
+    ),
+    "AP Statistics": (
+        "FRQs are scored holistically per part: communication and reasoning carry as "
+        "much weight as the numerical answer. Award full credit only when the response "
+        "is stated in context (named variable, population, and units where appropriate), "
+        "not just symbolically. For inference questions, require all four components — "
+        "defined parameter and hypotheses, conditions checked, mechanics (test statistic "
+        "and p-value, or the interval), and a conclusion linked to the significance level "
+        "and the original claim. Apply follow-through: an incorrect earlier value used "
+        "correctly downstream still earns the later points. Graph points require correctly "
+        "labeled axes and scale plus a shape/center/spread description tied to the "
+        "scenario; a bare numerical answer with no justification does not earn the "
+        "reasoning point."
     ),
     "AP Physics C: Mechanics": (
         "Calculus-based mechanics. Award points per the rubric's structure (e.g. correct "
