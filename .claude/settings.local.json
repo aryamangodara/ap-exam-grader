@@ -7,7 +7,8 @@
       "Bash(python _verify.py)",
       "Bash(python -c \"import os;print\\('%.3f MB' % \\(os.path.getsize\\('grader.ipynb'\\)/1e6\\)\\)\")",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(git push *)"
     ]
   }
 }
