@@ -129,6 +129,7 @@ Set `CONFIG["subject"]` to one of these canonical names (registered in
 - AP English Language and Composition
 - AP Computer Science A
 - AP Computer Science Principles
+- AP Statistics
 
 Each subject carries its own grading guidance (point structure, follow-through
 rules, what earns vs. doesn't earn credit) injected into the grading prompt.
