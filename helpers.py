@@ -133,6 +133,38 @@ def _is_transient(exc: Exception) -> bool:
     return any(str(c) in blob for c in _RETRYABLE_CODES)
 
 
+def _looks_empty(response) -> bool:
+    """True if the response carries no parsed structured content.
+
+    All grader call sites use ``response_schema``, so ``response.parsed is None``
+    means the model produced nothing usable — typically a safety/recitation
+    filter, a MAX_TOKENS truncation of the structured output, or a transient
+    blank response. Worth retrying.
+    """
+    return response is None or getattr(response, "parsed", None) is None
+
+
+def _diagnose_empty(response) -> str:
+    """One-line description of why a response has no parsed content."""
+    if response is None:
+        return "response is None"
+    finish = block = None
+    try:
+        cands = list(getattr(response, "candidates", None) or [])
+        if cands:
+            finish = getattr(cands[0], "finish_reason", None)
+    except Exception:
+        pass
+    try:
+        pf = getattr(response, "prompt_feedback", None)
+        if pf is not None:
+            block = getattr(pf, "block_reason", None)
+    except Exception:
+        pass
+    text_len = len(response.text or "") if getattr(response, "text", None) is not None else 0
+    return f"finish_reason={finish!r}, block_reason={block!r}, text_len={text_len}"
+
+
 def generate_with_retry(
     client: genai.Client,
     *,
@@ -141,23 +173,42 @@ def generate_with_retry(
     label: str = "",
     **kwargs,
 ):
-    """Call ``client.models.generate_content`` with retry on transient errors.
+    """Call ``client.models.generate_content`` with retry on transient failures.
 
-    Retries 429/499/5xx and CANCELLED/UNAVAILABLE/DEADLINE_EXCEEDED with
-    exponential backoff + jitter. Non-transient errors (400 bad request, auth
-    failures, etc.) and the final attempt's error are raised immediately.
+    Retries on two distinct flavours of transience:
+
+    1. **Exception-based** — 429/499/5xx and CANCELLED/UNAVAILABLE/
+       DEADLINE_EXCEEDED — with exponential backoff + jitter.
+    2. **Empty response** — the call succeeded HTTP-wise but came back with no
+       parsed content (``response.parsed is None``), typically a safety filter,
+       MAX_TOKENS truncation of structured output, or a transient blank reply.
+
+    Non-transient exceptions (400 bad request, auth failures) raise immediately.
+    On the final attempt an empty response is returned to the caller so it can
+    raise with the diagnostic from ``_diagnose_empty``.
     """
+    tag = f" [{label}]" if label else ""
     for attempt in range(1, max_attempts + 1):
         try:
-            return client.models.generate_content(**kwargs)
+            response = client.models.generate_content(**kwargs)
         except Exception as exc:
             if attempt == max_attempts or not _is_transient(exc):
                 raise
             delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
-            tag = f" [{label}]" if label else ""
             print(f"    transient Gemini error{tag} (attempt {attempt}/{max_attempts}): {exc}")
             print(f"    retrying in {delay:.1f}s...")
             time.sleep(delay)
+            continue
+        if _looks_empty(response):
+            if attempt == max_attempts:
+                return response  # let the caller raise with full diagnostics
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+            print(f"    empty Gemini response{tag} (attempt {attempt}/{max_attempts}): "
+                  f"{_diagnose_empty(response)}")
+            print(f"    retrying in {delay:.1f}s...")
+            time.sleep(delay)
+            continue
+        return response
 
 
 # ---------------------------------------------------------------------------
@@ -214,8 +265,8 @@ def ocr_submission(
     parsed = response.parsed
     if parsed is None:
         raise RuntimeError(
-            "Gemini returned no parsed ParsedSubmission. Raw text:\n"
-            + (response.text or "<empty>")
+            f"Gemini returned no parsed ParsedSubmission ({_diagnose_empty(response)}). "
+            f"Raw text:\n" + (response.text or "<empty>")
         )
     return parsed  # type: ignore[return-value]
 
@@ -278,8 +329,8 @@ def load_rubric(
     parsed = response.parsed
     if parsed is None:
         raise RuntimeError(
-            "Gemini returned no parsed ParsedRubric. Raw text:\n"
-            + (response.text or "<empty>")
+            f"Gemini returned no parsed ParsedRubric ({_diagnose_empty(response)}). "
+            f"Raw text:\n" + (response.text or "<empty>")
         )
 
     # Backfill metadata from context if model omitted it
@@ -370,8 +421,8 @@ def grade_question(
     parsed = response.parsed
     if parsed is None:
         raise RuntimeError(
-            f"Gemini returned no parsed QuestionScorecard for Q{answer.question_id}. "
-            f"Raw text:\n{response.text or '<empty>'}"
+            f"Gemini returned no parsed QuestionScorecard for Q{answer.question_id} "
+            f"({_diagnose_empty(response)}). Raw text:\n{response.text or '<empty>'}"
         )
 
     if review_recommended:
