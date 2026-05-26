@@ -15,6 +15,7 @@ SUBJECT_SLUG: dict[str, str] = {
     "AP Statistics":                           "statistics",
     "AP Physics C: Mechanics":                 "physics-c-mechanics",
     "AP Physics C: Electricity and Magnetism": "physics-c-em",
+    "AP Biology":                              "biology",
     "AP Chemistry":                            "chemistry",
     "AP Environmental Science":                "environmental-science",
     "AP Microeconomics":                       "microeconomics",
@@ -77,6 +78,25 @@ SUBJECT_GRADING_ADDENDA: dict[str, str] = {
         "Accept algebraically and calculus-equivalent expressions (including correct use "
         "of integrals/derivatives, Gauss's/Ampère's law, etc.) and correct symbolic "
         "answers. Require correct units and direction where the rubric specifies."
+    ),
+    "AP Biology": (
+        "FRQs are point-based; award each point independently. For quantitative "
+        "parts (typically Q1 / statistical-analysis), require the correct setup "
+        "AND the numerical answer with appropriate units; accept answers within "
+        "the rubric's stated tolerance and do not over-penalize significant "
+        "figures. Apply follow-through (consequent) credit: an incorrect earlier "
+        "value used correctly downstream still earns the later points. "
+        "Justify / Explain / Predict points require a stated mechanism at the "
+        "molecular, cellular, or organismal level (e.g. enzyme structure-function, "
+        "membrane transport, signal transduction, natural selection on heritable "
+        "variation) tied to the prompt — a correct conclusion with no valid "
+        "reasoning earns no reasoning point. For experimental-design parts, "
+        "require a testable hypothesis tied to the independent and dependent "
+        "variables, an explicit control, and a justification for replication or "
+        "sample size where the rubric specifies. Graph points require correctly "
+        "labeled axes with units, an appropriate scale, and data plotted "
+        "accurately; 'describe the data' demands a trend tied to the variables, "
+        "not a bare numerical restatement."
     ),
     "AP Chemistry": (
         "FRQs are point-based; award each point independently. For calculations, "
