@@ -629,6 +629,104 @@ def _synthesize_subpart_answers_from_parents(
     return updated, still_missing, recovered
 
 
+def _looks_like_subpart(child: str, parent: str) -> bool:
+    """True if ``child`` looks like a structural sub-part of ``parent``.
+
+    Guards against accidental prefix matches like parent ``"3"`` swallowing
+    OCR'd ``"30"``: requires the next char after the parent's qid to be either
+    a delimiter (``-``) or a letter, matching the project's qid conventions
+    (``1`` -> ``1a``, ``1a`` -> ``1a-i``, ``3a`` -> ``3a-ii``).
+    """
+    if child == parent or not child.startswith(parent):
+        return False
+    next_ch = child[len(parent):len(parent) + 1]
+    return next_ch == "-" or next_ch.isalpha()
+
+
+def _synthesize_parent_answers_from_subparts(
+    answer_by_qid: dict[str, TranscribedAnswer],
+    rubric_qids: set[str],
+) -> tuple[dict[str, TranscribedAnswer], dict[str, TranscribedAnswer]]:
+    """Fold orphan sub-part OCR blocks into the rubric parent they belong to.
+
+    Inverse of :func:`_synthesize_subpart_answers_from_parents`: when OCR
+    returned answers at finer granularity than the rubric expected, the
+    sub-part transcripts are orphaned (no rubric entry to grade them
+    against) and the parent's rubric points miss the evidence. Two flavours
+    are both handled here:
+
+    1. **Parent missing in OCR.** Rubric has ``"3a"`` with three rubric
+       points for three calculations; OCR returned ``"3a-i"`` / ``"3a-ii"``
+       / ``"3a-iii"`` separately. We synthesize a fresh parent answer by
+       concatenating the children — without it the parent lands in
+       ``missing_qids`` and is silently scored 0/max.
+    2. **Parent present in OCR with extra orphan children.** Rubric has
+       ``"1e"`` (with several points including a graph); OCR captured the
+       student's first answer block as ``"1e"`` and the graph as ``"1e-ii"``.
+       The graph points would be missed because the grader only sees
+       ``"1e"``'s transcript. We append the orphan children's transcripts to
+       the parent's existing one.
+
+    Each orphan child is assigned to its **most specific** rubric ancestor
+    (longest matching rubric qid), so OCR'd ``"1a-extra"`` lands under
+    rubric ``"1a"`` rather than rubric ``"1"`` when both rubric qids exist.
+    Orphan children are prefixed with their qid as a header (``[3a-i]``)
+    inside the merged transcript so the grader can attribute evidence to the
+    right sub-part.
+
+    Returns ``(updated_answer_by_qid, merged_parent_answers)`` where
+    ``merged_parent_answers`` maps parent qid -> the synthesized
+    :class:`TranscribedAnswer`. Callers should flag those qids for human
+    review — the merge format is generated, not what the student literally
+    wrote at the parent's granularity.
+    """
+    # Assign each orphan OCR'd qid to its most-specific rubric ancestor.
+    by_parent: dict[str, list[str]] = defaultdict(list)
+    sorted_rubric = sorted(rubric_qids, key=len, reverse=True)
+    for ocr_qid in answer_by_qid:
+        if ocr_qid in rubric_qids:
+            continue  # the grader will score it against its own rubric entry
+        parent = next(
+            (r for r in sorted_rubric if _looks_like_subpart(ocr_qid, r)),
+            None,
+        )
+        if parent is not None:
+            by_parent[parent].append(ocr_qid)
+
+    updated = dict(answer_by_qid)
+    merged: dict[str, TranscribedAnswer] = {}
+    for parent, children in by_parent.items():
+        children.sort()  # natural qid order: 3a-i, 3a-ii, 3a-iii
+        contributors = (
+            [parent] + children if parent in answer_by_qid else list(children)
+        )
+        parts: list[str] = []
+        for c in contributors:
+            t = answer_by_qid[c].transcript
+            # Tag every sub-part block so the grader can locate per-rubric-point
+            # evidence; the parent's own block stays untagged so it reads naturally.
+            parts.append(t if c == parent else f"[{c}]\n{t}")
+        merged_transcript = "\n\n".join(parts)
+        all_pages = sorted({
+            p for c in contributors for p in answer_by_qid[c].source_pages
+        })
+        min_conf = min(answer_by_qid[c].confidence for c in contributors)
+        all_snippets = [
+            s for c in contributors
+            for s in answer_by_qid[c].low_confidence_snippets
+        ]
+        synth = TranscribedAnswer(
+            question_id=parent,
+            transcript=merged_transcript,
+            confidence=min_conf,
+            source_pages=all_pages,
+            low_confidence_snippets=all_snippets,
+        )
+        updated[parent] = synth
+        merged[parent] = synth
+    return updated, merged
+
+
 # ---------------------------------------------------------------------------
 # Unattempted sub-parts — score 0/max so the denominator is the whole exam
 # ---------------------------------------------------------------------------
@@ -813,6 +911,7 @@ def render_html_report(
     *,
     low_confidence_threshold: float = 0.75,
     recovered_qids: list[str] | None = None,
+    merged_parent_answers: dict[str, TranscribedAnswer] | None = None,
 ) -> str:
     """Build a self-contained HTML report.
 
@@ -829,12 +928,21 @@ def render_html_report(
     "shared transcript" tag, since each sub-part was graded against the same
     parent transcript. The parent's own (now redundant) "not graded" card is
     suppressed in favour of its children.
+
+    ``merged_parent_answers`` maps a parent qid (e.g. ``"3a"``) to a
+    synthesized :class:`TranscribedAnswer` whose transcript was assembled by
+    concatenating per-sub-part OCR blocks (``"3a-i"``, ``"3a-ii"``,
+    ``"3a-iii"``) the rubric expected as a single block. The merged parent
+    card is rendered on the children's pages with a "merged from sub-parts"
+    tag; the children's own (rubric-less) orphan cards are suppressed.
     """
     esc = html.escape
     scorecards_by_qid = {qs.question_id: qs for qs in scorecard.questions}
     ocr_by_qid = {a.question_id: a for a in submission.answers}
     recovered_list = list(recovered_qids or [])  # preserve caller order for stable card order
     recovered_set = set(recovered_list)
+    merged_map = dict(merged_parent_answers or {})
+    merged_set = set(merged_map)
 
     # For each recovered sub-part, find its OCR parent so we can place the
     # sub-part's qcard on the parent's pages and surface the parent transcript.
@@ -853,6 +961,19 @@ def render_html_report(
             recovered_parents[sub] = parent
     parents_with_recovered_children = set(recovered_parents.values())
 
+    # Children of merged parents whose own transcripts were absorbed into the
+    # parent. They have no scorecard (they aren't in the rubric), so without
+    # this suppression they'd render as orphan "not graded" cards next to the
+    # real merged-parent card. Mirrors the rubric-aware guard inside
+    # `_synthesize_parent_answers_from_subparts`.
+    consumed_children: set[str] = set()
+    for parent in merged_set:
+        for cand in ocr_by_qid:
+            if cand in scorecards_by_qid:
+                continue  # has its own scorecard — not consumed
+            if _looks_like_subpart(cand, parent):
+                consumed_children.add(cand)
+
     # Build the answer list we actually render: keep every OCR'd answer except
     # parents whose children took their place, and synthesize one entry per
     # recovered sub-part that inherits the parent's source_pages + transcript
@@ -861,6 +982,8 @@ def render_html_report(
     for ans in submission.answers:
         if ans.question_id in parents_with_recovered_children:
             continue  # children render in its place — suppress the orphan card
+        if ans.question_id in consumed_children:
+            continue  # absorbed into a merged parent — suppress the orphan card
         augmented.append(ans)
     for sub, parent in recovered_parents.items():
         p_ans = ocr_by_qid[parent]
@@ -871,6 +994,8 @@ def render_html_report(
             source_pages=list(p_ans.source_pages),
             low_confidence_snippets=list(p_ans.low_confidence_snippets),
         ))
+    for parent_qid, merged_ans in merged_map.items():
+        augmented.append(merged_ans)
 
     # Map each page -> answers appearing on it (OCR order, recovered last).
     page_to_answers: dict[int, list[TranscribedAnswer]] = defaultdict(list)
@@ -920,10 +1045,14 @@ def render_html_report(
             ' <span class="tag review">shared transcript</span>'
             if ans.question_id in recovered_set else ""
         )
+        merged_flag = (
+            ' <span class="tag review">merged from sub-parts</span>'
+            if ans.question_id in merged_set else ""
+        )
         return f"""
         <div class="qcard">
           <div class="qcard-head">
-            <span class="qid">Q {esc(qs.question_id)}{ocr_flag}{shared_flag}</span>
+            <span class="qid">Q {esc(qs.question_id)}{ocr_flag}{shared_flag}{merged_flag}</span>
             <span class="qscore">{qs.points_earned:g} / {qs.points_possible:g}</span>
           </div>
           <pre class="transcript">{esc(qs.transcript_used or ans.transcript)}</pre>
@@ -1085,14 +1214,16 @@ def assemble_scorecard(
     question_scorecards: list[QuestionScorecard],
     missing_qids: list[str],
     recovered_qids: list[str] | None = None,
+    merged_qids: list[str] | None = None,
     config_echo: dict | None = None,
 ) -> Scorecard:
     """Total per-question scorecards into a Scorecard, with review flags.
 
     Flags cover unattempted (0/max) sub-parts, sub-parts whose transcript was
     recovered from a parent-level OCR block (unlabeled multi-part response),
-    questions whose OCR confidence fell below threshold, and any point graded
-    with low confidence.
+    parent questions whose answer was assembled by merging per-sub-part OCR
+    blocks, questions whose OCR confidence fell below threshold, and any
+    point graded with low confidence.
     """
     total_earned = sum(qs.points_earned for qs in question_scorecards)
     total_possible = sum(qs.points_possible for qs in question_scorecards)
@@ -1100,6 +1231,7 @@ def assemble_scorecard(
 
     missing_set = set(missing_qids)
     recovered_set = set(recovered_qids or [])
+    merged_set = set(merged_qids or [])
     review_flags: list[str] = []
     for qs in question_scorecards:
         if qs.question_id in missing_set:
@@ -1114,6 +1246,13 @@ def assemble_scorecard(
                 "grader attributed evidence to the right sub-part"
             )
             # Don't double-flag with the generic OCR / low-confidence messages.
+            continue
+        if qs.question_id in merged_set:
+            review_flags.append(
+                f"Q{qs.question_id}: rubric expected a single answer here but OCR returned "
+                "separate sub-part blocks; transcripts were concatenated — verify the grader "
+                "attributed each rubric point to the right sub-part of the merged transcript"
+            )
             continue
         if any(ps.review_recommended for ps in qs.point_scores):
             review_flags.append(f"Q{qs.question_id}: OCR confidence below threshold — verify transcript")
@@ -1209,8 +1348,24 @@ def grade_exam(
             f"OCR block: {', '.join(recovered_qids)}"
         )
 
+    # Inverse rescue: fold orphan sub-part OCR blocks into the rubric parent
+    # they belong to. Handles both flavours: rubric has ``"3a"`` but OCR
+    # returned only ``"3a-i"`` / ``"3a-ii"`` / ``"3a-iii"`` (no parent), AND
+    # rubric has ``"1e"`` while OCR has both ``"1e"`` and orphan ``"1e-ii"``
+    # (parent + extra children) — without this, evidence in the children is
+    # never seen by the parent's grading call.
+    answer_by_qid, merged_parent_answers = (
+        _synthesize_parent_answers_from_subparts(answer_by_qid, set(rubric_by_qid))
+    )
+    merged_qids = sorted(merged_parent_answers)
+    if merged_qids:
+        print(
+            f"  Merged {len(merged_qids)} parent answer(s) from per-sub-part OCR "
+            f"blocks: {', '.join(merged_qids)}"
+        )
+
     qids_to_grade = sorted(universe & set(answer_by_qid))
-    missing_qids = sorted(set(still_missing) & universe)
+    missing_qids = sorted(universe - set(answer_by_qid))
 
     question_scorecards = grade_questions_parallel(
         client, qids_to_grade, rubric_by_qid, answer_by_qid,
@@ -1218,7 +1373,7 @@ def grade_exam(
         subject_addendum=subject_addendum, model=model_grading,
         low_confidence_threshold=low_confidence_threshold,
         max_workers=grading_max_workers,
-        force_review_qids=set(recovered_qids),
+        force_review_qids=set(recovered_qids) | set(merged_qids),
     )
     question_scorecards += build_unattempted_scorecards(rubric_by_qid, missing_qids)
     question_scorecards.sort(key=lambda qs: qs.question_id)
@@ -1227,6 +1382,7 @@ def grade_exam(
         subject=subject, year=year, set_label=set_label,
         question_scorecards=question_scorecards, missing_qids=missing_qids,
         recovered_qids=recovered_qids,
+        merged_qids=merged_qids,
         config_echo=config_echo,
     )
     return {
@@ -1237,6 +1393,7 @@ def grade_exam(
         "qids_to_grade": qids_to_grade,
         "missing_qids": missing_qids,
         "recovered_qids": recovered_qids,
+        "merged_parent_answers": merged_parent_answers,
     }
 
 

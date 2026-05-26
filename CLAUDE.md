@@ -92,6 +92,35 @@ answer sub-parts)`, scores rubric-only sub-parts 0/max, and raises if the
 overlap is empty — that empty-overlap error is the first thing to check when a
 score looks wrong (usually a question-ID formatting mismatch).
 
+Even after `flatten_rubric_by_subpart`, the rubric and OCR can disagree on the
+*depth* of sub-parts (rubric collapses `3a-i/ii/iii` under `3a`; rubric splits
+`4` into `4a/4b/4c/4d`). Two helpers bridge that in `grade_exam` before
+grading, and **both flag the bridged qids for human review** (their evidence
+attribution is generated, not literal student labels):
+
+1. `_synthesize_subpart_answers_from_parents` — rubric expects sub-parts but
+   OCR returned a single parent block (student wrote one continuous response
+   without sub-part labels). Each missing sub-part gets a copy of the parent
+   transcript so it can be graded; the parent's now-redundant orphan card is
+   suppressed in the HTML in favour of the per-sub-part cards.
+2. `_synthesize_parent_answers_from_subparts` — rubric expects a parent qid
+   but OCR returned per-sub-part blocks (student wrote labeled `(i)`, `(ii)`,
+   `(iii)` for what the rubric grades as a single `3a`). Orphan children
+   (OCR'd qids that aren't rubric entries) are folded into their most-specific
+   rubric ancestor: a missing parent gets a synthesized answer from
+   concatenated children; an existing parent gets the orphans appended after
+   its own transcript (e.g. rubric `1e` keeps its sentence + appends the
+   orphan `1e-ii` graph). Each sub-part block is prefixed with `[3a-i]`
+   inside the merged transcript so the grader can attribute evidence per
+   rubric point. The orphan child cards are suppressed in the HTML and the
+   parent card carries a "merged from sub-parts" tag.
+
+When debugging a low score, the order to check is: (a) qid casing mismatch
+(both ingestion points lower-case via `_normalize_qid`); (b) granularity
+mismatch (look for either recovery message in the run log: `Recovered N
+sub-part(s)…` or `Merged N parent answer(s)…`); (c) genuine rubric/OCR drift
+that neither helper covers — those land in `missing_qids` and score 0/max.
+
 ## Conventions specific to this repo
 
 - **Editing the notebook:** the `.ipynb` is large because answer-page images

@@ -119,6 +119,8 @@ Set `CONFIG["subject"]` to one of these canonical names (registered in
 - AP Precalculus
 - AP Physics C: Mechanics
 - AP Physics C: Electricity and Magnetism
+- AP Biology
+- AP Chemistry
 - AP Environmental Science
 - AP Microeconomics
 - AP Macroeconomics
