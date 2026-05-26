@@ -8,7 +8,7 @@ You will be given TWO sets of page images for a single student's exam:
 
 Your job:
 
-1. **Determine canonical question IDs from the question PDF.** Identifiers may appear as "1", "2(a)", "Part B", "Question 3", etc. Normalize to compact form: `1a`, `2`, `3b-ii`. Sub-parts under question 1 become `1a`, `1b`, etc.
+1. **Determine canonical question IDs from the question PDF.** Identifiers may appear as "1", "2(a)", "Part B", "Question 3", "1A", etc. Normalize to compact **lowercase** form: `1a`, `2`, `3b-ii`. Sub-part letters are ALWAYS lowercase (`1a`, never `1A`); Roman numerals are ALWAYS lowercase (`3b-ii`, never `3B-II`). Sub-parts under question 1 become `1a`, `1b`, etc.
 
 2. **Transcribe each student answer verbatim.** Match every transcribed answer to one of the canonical question IDs from step 1. Preserve punctuation, meaningful line breaks, and spelling errors — do NOT correct the student's content.
 

@@ -212,6 +212,31 @@ def generate_with_retry(
 
 
 # ---------------------------------------------------------------------------
+# Question-ID normalization — canonical lowercase form everywhere
+# ---------------------------------------------------------------------------
+
+def _normalize_qid(qid: str) -> str:
+    """Canonicalize a question identifier to lowercase + trimmed.
+
+    Both the OCR and rubric-parse passes can drift on sub-part casing — Gemini
+    sometimes returns ``"1A"`` / ``"2B-i"`` when the prompt says ``"1a"`` /
+    ``"2b-i"``. Without normalization, the grader's ``answers ∩ rubric`` set
+    is empty and every sub-part is silently scored 0/max via
+    :func:`build_unattempted_scorecards`. Applying ``.lower()`` at every
+    ingestion point guarantees both sides match.
+    """
+    return (qid or "").strip().lower()
+
+
+def _normalize_rubric_qids(rubric) -> None:
+    """In-place: lowercase every question_id inside a ParsedRubric."""
+    for q in rubric.questions:
+        q.question_id = _normalize_qid(q.question_id)
+        for p in q.rubric_points:
+            p.question_id = _normalize_qid(p.question_id)
+
+
+# ---------------------------------------------------------------------------
 # OCR — joint pass over question + answer PDFs
 # ---------------------------------------------------------------------------
 
@@ -268,6 +293,11 @@ def ocr_submission(
             f"Gemini returned no parsed ParsedSubmission ({_diagnose_empty(response)}). "
             f"Raw text:\n" + (response.text or "<empty>")
         )
+    # Normalize sub-part casing — Gemini occasionally returns "1A" / "2B-i"
+    # instead of the prompt-specified "1a" / "2b-i". Without this, the
+    # answers-vs-rubric intersection is empty and everything scores 0/max.
+    for ans in parsed.answers:
+        ans.question_id = _normalize_qid(ans.question_id)
     return parsed  # type: ignore[return-value]
 
 
@@ -299,7 +329,10 @@ def load_rubric(
 
     cache_path = pdf_path.with_suffix(pdf_path.suffix + ".parsed.json")
     if cache_path.exists() and not force_reparse:
-        return ParsedRubric.model_validate_json(cache_path.read_text(encoding="utf-8"))
+        cached = ParsedRubric.model_validate_json(cache_path.read_text(encoding="utf-8"))
+        # Defensive: normalize old caches whose ids might be mixed-case.
+        _normalize_rubric_qids(cached)
+        return cached
 
     images = render_pdf_to_images(pdf_path, dpi=dpi)
     prompt = Path(prompt_path).read_text(encoding="utf-8")
@@ -340,6 +373,9 @@ def load_rubric(
         parsed.year = year
     if set_label and not parsed.set_label:
         parsed.set_label = set_label
+
+    # Normalize sub-part casing before writing the cache so future loads stay clean.
+    _normalize_rubric_qids(parsed)
 
     cache_path.write_text(parsed.model_dump_json(indent=2), encoding="utf-8")
     return parsed  # type: ignore[return-value]
