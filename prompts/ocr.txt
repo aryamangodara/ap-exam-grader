@@ -18,12 +18,42 @@ Your job:
 
 4. **Code in plain text.** For Java/Python/etc., preserve indentation and exact syntax. Do NOT wrap code in LaTeX.
 
-5. **Multi-page answers.** If one question's answer spans multiple pages of the Answer PDF, merge them into a single `TranscribedAnswer` and list every contributing Answer-PDF page number in `source_pages`.
+5. **Visual content (diagrams, graphs, structures, drawings).** Every diagram, graph, structure, sketch, or non-text visual must be transcribed as a **detailed structured description** inside square brackets. The grader cannot see the page image — every spatial detail the rubric might care about must be in the transcript text.
 
-6. **Confidence per question** in `[0, 1]`, self-reported. If specific snippets are illegible or uncertain, include them verbatim in `low_confidence_snippets` (the exact uncertain string as you transcribed it).
+   **Forbidden:** one-line generic summaries. NEVER write `[Lewis structure of glycine]`, `[Reaction energy graph]`, `[Graph with peaks circled]`, `[Diagram of water molecules]`. These strip exactly the detail rubrics score against.
 
-7. **Unassigned content.** Scratch work, crossed-out content, page headers, doodles, or marks that cannot be confidently mapped to a question go in `unassigned_text` (one entry per chunk).
+   **Required (apply whichever are visible):**
+   - Relative position language: "rightmost", "leftmost", "tallest", "above the peak at x≈4", "between the two reactants" — not just "the two peaks".
+   - Axes for any graph: label, units, scale/range, gridline values.
+   - Every data feature with its position: peaks (x-value, relative height), curves (start, end, monotonicity, inflection), shaded regions (which interval), arrows (from-atom/point → to-atom/point, length, direction).
+   - Every annotation the student added: circles, boxes, underlines, labels, asterisks — say WHAT they enclose and roughly WHERE.
+   - For chemistry structures: every atom by element symbol, every bond as `-` `=` `≡` with the two atoms it joins, every lone pair (e.g. "two lone pairs on O"), every formal charge (`+`, `-`) drawn near which atom, partial charges (δ+, δ-) if shown, geometry hints (linear / bent / tetrahedral / trigonal planar).
+   - For H-bonds / intermolecular interactions: which donor atom (which H) points at which acceptor atom (which lone pair) on which molecule, drawn as dotted/dashed lines.
+   - For physics diagrams: vectors with tail, head, direction, labelled magnitude; coordinate axes; labelled forces/fields.
+   - For biology diagrams: each labelled structure/organelle and where, arrow directions in cycles, labelled stages.
 
-8. **`page_count`** is the number of pages in the student Answer PDF — not the question PDF.
+   **Worked examples** (study the level of detail, not the exact wording):
+
+   - Lewis structure of `ClO2F`:
+     `[Lewis structure: central Cl atom. Double bond Cl=O up. Double bond Cl=O down. Single bond Cl-F to the right. F has 3 lone pairs. Each O has 2 lone pairs. Cl has 1 lone pair. Formal charges shown: none.]`
+
+   - Glycine zwitterion with two water molecules H-bonding:
+     `[Zwitterion: H3N(+)-CH2-COO(-) drawn horizontally, NH3+ on left, COO- on right. Water #1 on the left: O of H-O-H directed at one of the N-H hydrogens (lone pair on water O → H on N+), shown as a dashed line. Water #2 on the right: one H of H-O-H directed at a lone pair on the lower O of carboxylate (H of water → lone pair on O-), shown as a dashed line. δ+ and δ- not labelled by the student.]`
+
+   - Photoelectron spectrum (PES) with two peaks circled:
+     `[Graph: x-axis = binding energy in MJ/mol (decreasing left to right, range ~100 to ~0). y-axis = relative number of electrons. Four peaks total. Leftmost peak tallest, near 100 MJ/mol. Three smaller peaks to the right. Student has drawn a single circle around the two RIGHTMOST peaks (i.e. the two peaks with the lowest binding energy).]`
+
+   - Reaction-energy profile (two-step):
+     `[Reaction-energy diagram: x-axis = reaction progress, y-axis = potential energy. Continuous curve from reactants on the left (low plateau labelled "ClO2 + F2") rises to a FIRST peak (higher), drops to a small dip labelled "intermediate ClO2F + F", rises again to a SECOND peak (lower than the first), drops to products on the right. Two activation-energy peaks; first peak is higher than second.]`
+
+   When the student's drawing is itself ambiguous (e.g. you can't tell which O of the carboxylate the water is bonded to), say so verbatim inside the brackets ("water-2 H appears to point between the two carboxylate O atoms").
+
+6. **Multi-page answers.** If one question's answer spans multiple pages of the Answer PDF, merge them into a single `TranscribedAnswer` and list every contributing Answer-PDF page number in `source_pages`.
+
+7. **Confidence per question** in `[0, 1]`, self-reported. If specific snippets are illegible or uncertain, include them verbatim in `low_confidence_snippets` (the exact uncertain string as you transcribed it).
+
+8. **Unassigned content.** Scratch work, crossed-out content, page headers, doodles, or marks that cannot be confidently mapped to a question go in `unassigned_text` (one entry per chunk).
+
+9. **`page_count`** is the number of pages in the student Answer PDF — not the question PDF.
 
 Return JSON matching the `ParsedSubmission` schema exactly. Emit no text outside the JSON.

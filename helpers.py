@@ -247,6 +247,7 @@ def ocr_submission(
     prompt_path: Path,
     model: str = "gemini-3.5-flash",
     thinking_level: str | None = None,
+    subject_addendum: str = "",
 ) -> ParsedSubmission:
     """OCR the student's handwritten answers, using the question PDF as context.
 
@@ -258,8 +259,21 @@ def ocr_submission(
     Transcription is not a reasoning task, so "low"/"minimal" cuts latency
     sharply. Leave None to use the model's default. Ignored by models that
     predate thinking_level (e.g. 2.5), which use the legacy thinking_budget.
+
+    `subject_addendum` is appended to the base prompt as an extra section
+    when non-empty. Used to inject per-subject diagram-description guidance
+    from :data:`config.SUBJECT_OCR_ADDENDA` (chemistry Lewis structures,
+    physics free-body diagrams, biology cycle diagrams). Empty string leaves
+    behaviour identical to subjects without an addendum.
     """
     prompt = Path(prompt_path).read_text(encoding="utf-8")
+    if subject_addendum:
+        prompt = (
+            prompt.rstrip()
+            + "\n\n# Subject-specific OCR guidance\n"
+            + subject_addendum.strip()
+            + "\n"
+        )
 
     contents: list = [prompt, "\n=== QUESTION PDF (typed) — context only, do not transcribe ===\n"]
     for i, img in enumerate(question_images, start=1):
@@ -1286,6 +1300,7 @@ def grade_exam(
     rubric_prompt_path: Path,
     grade_prompt_path: Path,
     subject_addendum: str = "",
+    ocr_subject_addendum: str = "",
     model_ocr: str = "gemini-3.1-pro-preview",
     model_rubric: str = "gemini-3.5-flash",
     model_grading: str = "gemini-3.5-flash",
@@ -1310,6 +1325,7 @@ def grade_exam(
     submission = ocr_submission(
         client, question_images, answer_images, ocr_prompt_path,
         model=model_ocr, thinking_level=ocr_thinking_level,
+        subject_addendum=ocr_subject_addendum,
     )
 
     rubric = load_rubric(

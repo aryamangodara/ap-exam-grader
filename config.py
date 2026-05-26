@@ -182,6 +182,65 @@ SUBJECT_GRADING_ADDENDA: dict[str, str] = {
     ),
 }
 
+# Subject-specific OCR addenda. Injected into the OCR prompt verbatim AFTER
+# the generic Visual content rules in prompts/ocr.txt, so each subject can
+# pin down the notation conventions its rubrics care about. Subjects without
+# an entry use the base prompt unchanged (i.e. the .get(subject, "") default).
+SUBJECT_OCR_ADDENDA: dict[str, str] = {
+    "AP Chemistry": (
+        "Diagram fidelity matters more than for other subjects — rubric points "
+        "are awarded for specific bonds, lone pairs, charges and geometries the "
+        "student drew. For Lewis / dot structures: name every atom by element "
+        "symbol, every bond by its multiplicity and the two atoms it joins "
+        "(e.g. 'C=O', 'N-H'), every lone pair (count and on which atom), every "
+        "formal charge with the sign and adjacent atom, and the overall shape "
+        "(bent, trigonal planar, tetrahedral, octahedral, etc.) when discernible. "
+        "For intermolecular-force diagrams (hydrogen bonds, dipole-dipole, etc.): "
+        "for each interaction line drawn, state the donor atom (and which H on it), "
+        "the acceptor atom (and which lone pair on it), the molecule each belongs "
+        "to, and the position on the page (left/right/top/bottom of the central "
+        "species). For PES/spectroscopy: count peaks, give relative heights and "
+        "x-position (binding energy or wavelength) for each, and identify exactly "
+        "which peaks the student circled/marked using both absolute position "
+        "(numeric x value or rough range) and relative language ('rightmost two', "
+        "'leftmost', 'tallest'). For reaction-energy / potential-energy diagrams: "
+        "describe each peak's relative height versus the others, the position and "
+        "label of any intermediate, and whether reactants are higher or lower than "
+        "products. For volumetric / glassware sketches: say whether the meniscus "
+        "is concave or convex, where its bottom sits relative to the calibration "
+        "line, and what (if anything) is labelled."
+    ),
+    "AP Biology": (
+        "For biological diagrams (cell, organelle, tissue, organ, organism): "
+        "name every structure the student labelled and where it sits relative "
+        "to others (nucleus inside cytoplasm, mitochondrion adjacent to ribosome, "
+        "etc.). For cycle diagrams (Krebs, Calvin, cell cycle, nitrogen cycle): "
+        "name each stage in order, the direction of every arrow, and any "
+        "inputs/outputs the student wrote on the arrows. For experimental graphs: "
+        "axes (label + units + scale), trend per group/treatment, error bars or "
+        "ranges if drawn, and any annotation the student added (asterisks for "
+        "significance, labelled controls vs experimentals). For pedigrees, "
+        "Punnett squares, gel images: row/column layout and what's in each cell."
+    ),
+    "AP Physics C: Mechanics": (
+        "For free-body / force diagrams: every vector with its tail point, head "
+        "direction (up/down/left/right or angle), labelled magnitude (mg, N, T, "
+        "f, etc.), and what object it acts on. For motion / kinematics sketches: "
+        "coordinate axes, position vs time / velocity vs time / acceleration vs "
+        "time curves with their shape (linear, parabolic, constant) and key "
+        "values at labelled points. For graphs generally: full axis labels with "
+        "units, scale, every plotted point or curve, area under curve if shaded."
+    ),
+    "AP Physics C: Electricity and Magnetism": (
+        "For circuit diagrams: each component (resistor, capacitor, battery, "
+        "switch, inductor) with its labelled value, connection topology, and "
+        "labelled current direction or polarity. For field diagrams: arrow "
+        "directions (electric / magnetic), arrow density relative to source, "
+        "labelled magnitudes, and any Gaussian/Amperian surfaces drawn. For "
+        "graphs: axes, scale, every plotted feature including discontinuities."
+    ),
+}
+
 # Where on AP Central to direct the user to download a rubric they haven't
 # already placed in rubrics/.
 AP_CENTRAL_EXAM_PAGE = "https://apcentral.collegeboard.org/courses/ap-{slug}/exam/past-exam-questions"
