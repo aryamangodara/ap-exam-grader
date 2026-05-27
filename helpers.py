@@ -14,12 +14,15 @@ import base64
 import html
 import os
 import random
+import re
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+from typing import Literal, TypedDict
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -35,6 +38,29 @@ from schemas import (
     Scorecard,
     TranscribedAnswer,
 )
+
+
+class ExamFolder(TypedDict):
+    slug: str
+    subject: str
+    folder: Path
+    questions_pdf: Path
+    answers_pdf: Path
+    marking_scheme_pdf: Path
+
+
+class GradeExamResult(TypedDict):
+    scorecard: Scorecard
+    submission: ParsedSubmission
+    answer_images: list[Image.Image]
+    rubric: ParsedRubric
+    qids_to_grade: list[str]
+    missing_qids: list[str]
+    recovered_qids: list[str]
+    merged_parent_answers: dict[str, TranscribedAnswer]
+
+
+_ALL_QUESTIONS: Literal["all"] = "all"
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +187,7 @@ def _diagnose_empty(response) -> str:
             block = getattr(pf, "block_reason", None)
     except Exception:
         pass
-    text_len = len(response.text or "") if getattr(response, "text", None) is not None else 0
+    text_len = len(getattr(response, "text", None) or "")
     return f"finish_reason={finish!r}, block_reason={block!r}, text_len={text_len}"
 
 
@@ -229,11 +255,12 @@ def _normalize_qid(qid: str) -> str:
 
 
 def _normalize_rubric_qids(rubric) -> None:
-    """In-place: lowercase every question_id inside a ParsedRubric."""
+    """In-place: lowercase every question_id (and point_id) inside a ParsedRubric."""
     for q in rubric.questions:
         q.question_id = _normalize_qid(q.question_id)
         for p in q.rubric_points:
             p.question_id = _normalize_qid(p.question_id)
+            p.point_id = _normalize_qid(p.point_id)
 
 
 # ---------------------------------------------------------------------------
@@ -527,15 +554,12 @@ def grade_questions_parallel(
     if not work:
         return []
 
-    import threading
-    import time as _time
-
-    t0 = _time.perf_counter()
+    t0 = time.perf_counter()
     timings: dict[str, tuple[float, float]] = {}  # qid -> (start, end) relative to t0
 
     def _grade(item: tuple[str, QuestionRubric, TranscribedAnswer]):
         qid, qr, ans = item
-        start = _time.perf_counter() - t0
+        start = time.perf_counter() - t0
         qs = grade_question(
             client=client,
             question_rubric=qr,
@@ -548,7 +572,7 @@ def grade_questions_parallel(
                 qid in force_review or ans.confidence < low_confidence_threshold
             ),
         )
-        end = _time.perf_counter() - t0
+        end = time.perf_counter() - t0
         timings[qid] = (start, end)
         if verbose:
             print(f"  [{threading.current_thread().name}] Q{qid}: "
@@ -567,11 +591,25 @@ def grade_questions_parallel(
                 raise RuntimeError(f"Grading failed for Q{qid}: {exc}") from exc
             results[qid] = qs
 
-    # --- Concurrency diagnostic -------------------------------------------
-    wall = _time.perf_counter() - t0
+    _print_concurrency_report(timings, wall=time.perf_counter() - t0, workers=workers)
+
+    # Return in the original qid order (as_completed yields out of order).
+    return [results[qid] for qid, _, _ in work]
+
+
+def _print_concurrency_report(
+    timings: dict[str, tuple[float, float]],
+    *,
+    wall: float,
+    workers: int,
+) -> None:
+    """Print a wall-time / overlap diagnostic for a parallel grading pass.
+
+    ``timings`` maps qid -> (start, end) seconds relative to the pass's t0.
+    Peak overlap is computed by sweeping the start/end events in time order.
+    """
     busy = sum(e - s for s, e in timings.values())
-    # Peak overlap: max number of requests in flight at any instant.
-    events = []
+    events: list[tuple[float, int]] = []
     for s, e in timings.values():
         events.append((s, 1))
         events.append((e, -1))
@@ -585,9 +623,6 @@ def grade_questions_parallel(
     if peak <= 1:
         print("  ⚠️ Requests ran one-at-a-time (no overlap). Likely server-side "
               "rate-limiting on your Gemini tier — not a threading problem.")
-
-    # Return in the original qid order (as_completed yields out of order).
-    return [results[qid] for qid, _, _ in work]
 
 
 # ---------------------------------------------------------------------------
@@ -610,8 +645,14 @@ def _synthesize_subpart_answers_from_parents(
     response — the original bug this guards against.
 
     Matching rule: for each missing sub-part ``X``, the **longest existing**
-    OCR'd question id that is a strict prefix of ``X`` wins (so ``"1b"`` is
-    preferred over ``"1"`` when both exist for a sub-part like ``"1b-ii"``).
+    OCR'd question id for which :func:`_looks_like_subpart` accepts the pair
+    wins (so ``"1b"`` is preferred over ``"1"`` when both exist for a
+    sub-part like ``"1b-ii"``). The structural check matters — a raw
+    ``startswith`` would incorrectly treat ``6a`` as a parent of the combined
+    rubric qid ``6ab``, copying only ``6a``'s transcript and orphaning
+    ``6b``'s prose. Combined-form qids are handled separately by
+    :func:`_synthesize_parent_answers_from_subparts` via
+    :func:`_expand_combined_qid`.
 
     Returns ``(updated_answer_by_qid, still_missing, recovered_qids)``.
     ``recovered_qids`` is the list of sub-parts we filled in — callers should
@@ -625,7 +666,7 @@ def _synthesize_subpart_answers_from_parents(
     candidates = sorted(updated, key=len, reverse=True)
     for sub in missing_qids:
         parent = next(
-            (c for c in candidates if c != sub and sub.startswith(c)),
+            (c for c in candidates if _looks_like_subpart(sub, c)),
             None,
         )
         if parent is None:
@@ -643,18 +684,92 @@ def _synthesize_subpart_answers_from_parents(
     return updated, still_missing, recovered
 
 
+# Lowercase Roman numerals 1-10 — used as sub-part markers under a parent
+# letter (``3a-i``, ``3a-ii``, …). The set lets us tell a true sub-part
+# (``3a-i``) from a combined-form qid (``3c-d`` covers parts c AND d).
+_ROMAN_NUMERAL_SUBPARTS: frozenset[str] = frozenset({
+    "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
+})
+
+
 def _looks_like_subpart(child: str, parent: str) -> bool:
     """True if ``child`` looks like a structural sub-part of ``parent``.
 
-    Guards against accidental prefix matches like parent ``"3"`` swallowing
-    OCR'd ``"30"``: requires the next char after the parent's qid to be either
-    a delimiter (``-``) or a letter, matching the project's qid conventions
-    (``1`` -> ``1a``, ``1a`` -> ``1a-i``, ``3a`` -> ``3a-ii``).
+    A child is a sub-part only when the boundary between parent and child is
+    *clean* — either a Roman-numeral dash-suffix (``3a`` -> ``3a-i``) or a
+    digit-ending parent that gains a letter (``3`` -> ``3a``, ``6`` ->
+    ``6ab``). This deliberately rejects two cases that look like sub-parts
+    but aren't:
+
+    - ``6a`` -> ``6ab``: letter glued onto letter with no delimiter. ``6ab``
+      is a **combined** rubric qid covering parts a and b, not a child of
+      ``6a``. The raw ``startswith`` rule used to false-match this and the
+      parent-to-child rescue would copy only ``6a``'s transcript into ``6ab``
+      while orphaning ``6b``'s prose — the original AP Statistics bug.
+    - ``3c`` -> ``3c-d``: dash followed by a non-Roman letter. ``3c-d`` is a
+      combined qid covering parts c and d, not a sub-part of c. We accept the
+      dash form only when the suffix matches the project's Roman-numeral
+      convention.
+
+    Combined-form qids are handled separately by
+    :func:`_expand_combined_qid`.
     """
     if child == parent or not child.startswith(parent):
         return False
-    next_ch = child[len(parent):len(parent) + 1]
-    return next_ch == "-" or next_ch.isalpha()
+    suffix = child[len(parent):]
+    if suffix.startswith("-"):
+        # Accept only Roman-numeral sub-part suffixes; everything else after
+        # a dash is a combined-form range (``3c-d``) or an unknown form.
+        rest = suffix[1:]
+        return rest in _ROMAN_NUMERAL_SUBPARTS
+    # No delimiter: only legitimate when the parent is question-level (ends
+    # in a digit) and the suffix opens with a letter (the sub-part letter).
+    return bool(parent) and parent[-1].isdigit() and suffix[:1].isalpha()
+
+
+# Combined-qid forms commonly used in AP rubrics where one rubric point covers
+# multiple sub-parts the student answered separately:
+#   '6ab'   -> ['6a', '6b']        packed letters after the question number
+#   '7abc'  -> ['7a', '7b', '7c']
+#   '3c-d'  -> ['3c', '3d']        dashed letter range
+#   '3a-c'  -> ['3a', '3b', '3c']
+_PACKED_LETTERS_RE = re.compile(r"^(\d+)([a-z]{2,})$")
+_LETTER_RANGE_RE = re.compile(r"^(\d+)([a-z])-([a-z])$")
+
+
+def _expand_combined_qid(qid: str) -> list[str] | None:
+    """Expand a combined rubric qid into its constituent sub-part qids.
+
+    Returns ``None`` for single-sub-part qids (``3a``, ``3a-i``, ``6``) so
+    the existing parent/sub-part recovery passes are unaffected. Returns the
+    constituent list for combined forms — see module-level patterns.
+
+    Used by :func:`_synthesize_parent_answers_from_subparts` to merge OCR'd
+    constituents into a synthesized combined answer (e.g. concatenate ``6a``
+    and ``6b`` transcripts so the ``6ab`` rubric can grade both halves of the
+    response).
+    """
+    m = _PACKED_LETTERS_RE.match(qid)
+    if m:
+        num, letters = m.group(1), m.group(2)
+        # Don't mistake an un-dashed Roman numeral (rare but defensive) for a
+        # packed-letter combination — ``3ii`` is not ``[3i, 3i]``.
+        if letters in _ROMAN_NUMERAL_SUBPARTS:
+            return None
+        return [num + ch for ch in letters]
+    m = _LETTER_RANGE_RE.match(qid)
+    if m:
+        num, start, end = m.group(1), m.group(2), m.group(3)
+        # ``i`` / ``v`` / ``x`` as a range endpoint is far more likely to be a
+        # Roman-numeral sub-part (``3a-i``, ``3a-v``, ``3a-x``) than a literal
+        # a-to-i range. The 24-sub-part theoretical case is sacrificed for
+        # the common case; multi-char Romans (``ii``, ``iii``) can't reach
+        # here anyway because the regex requires exactly one trailing letter.
+        if end in _ROMAN_NUMERAL_SUBPARTS or start in _ROMAN_NUMERAL_SUBPARTS:
+            return None
+        if start < end:
+            return [num + chr(c) for c in range(ord(start), ord(end) + 1)]
+    return None
 
 
 def _synthesize_parent_answers_from_subparts(
@@ -680,6 +795,12 @@ def _synthesize_parent_answers_from_subparts(
        The graph points would be missed because the grader only sees
        ``"1e"``'s transcript. We append the orphan children's transcripts to
        the parent's existing one.
+    3. **Combined-form rubric qid.** Rubric has ``"6ab"`` (one point covers
+       parts a AND b, e.g. AP Statistics) but the student wrote ``"6a"``
+       and ``"6b"`` separately. :func:`_expand_combined_qid` resolves
+       ``"6ab"`` to ``["6a", "6b"]`` and both OCR blocks get folded under
+       the combined rubric qid. The same applies to dashed ranges like
+       ``"3c-d"``.
 
     Each orphan child is assigned to its **most specific** rubric ancestor
     (longest matching rubric qid), so OCR'd ``"1a-extra"`` lands under
@@ -695,15 +816,34 @@ def _synthesize_parent_answers_from_subparts(
     wrote at the parent's granularity.
     """
     # Assign each orphan OCR'd qid to its most-specific rubric ancestor.
+    # "Orphan" = OCR'd qid that isn't itself a rubric entry, so it has no
+    # direct grading target. It joins its ancestor either as a structural
+    # sub-part (`_looks_like_subpart`) or as a combined-qid constituent
+    # (`_expand_combined_qid`).
     by_parent: dict[str, list[str]] = defaultdict(list)
     sorted_rubric = sorted(rubric_qids, key=len, reverse=True)
+    # Precompute the constituent lookup so combined-form matches are cheap.
+    constituents_of: dict[str, list[str]] = {}
+    for r in rubric_qids:
+        parts = _expand_combined_qid(r)
+        if parts:
+            constituents_of[r] = parts
     for ocr_qid in answer_by_qid:
         if ocr_qid in rubric_qids:
             continue  # the grader will score it against its own rubric entry
+        # Most-specific structural sub-part ancestor.
         parent = next(
             (r for r in sorted_rubric if _looks_like_subpart(ocr_qid, r)),
             None,
         )
+        if parent is None:
+            # Fall back to combined-form matching: the rubric qid bundles
+            # multiple sub-parts (``"6ab"`` covers a AND b), and this OCR
+            # answer is one of them.
+            parent = next(
+                (r for r in sorted_rubric if ocr_qid in constituents_of.get(r, ())),
+                None,
+            )
         if parent is not None:
             by_parent[parent].append(ocr_qid)
 
@@ -960,10 +1100,12 @@ def render_html_report(
 
     # For each recovered sub-part, find its OCR parent so we can place the
     # sub-part's qcard on the parent's pages and surface the parent transcript.
-    # Mirrors the longest-prefix rule in `_synthesize_subpart_answers_from_parents`.
+    # Mirrors the structural rule in `_synthesize_subpart_answers_from_parents`
+    # — a raw `startswith` here would false-match combined qids like `6ab` as a
+    # parent of `6a`, placing the qcard on the wrong page.
     def _parent_of(sub: str) -> str | None:
         for cand in sorted(ocr_by_qid, key=len, reverse=True):
-            if cand != sub and sub.startswith(cand):
+            if _looks_like_subpart(sub, cand):
                 return cand
         return None
     # Build as a plain dict (insertion-ordered) so qcards render in the order
@@ -979,13 +1121,17 @@ def render_html_report(
     # parent. They have no scorecard (they aren't in the rubric), so without
     # this suppression they'd render as orphan "not graded" cards next to the
     # real merged-parent card. Mirrors the rubric-aware guard inside
-    # `_synthesize_parent_answers_from_subparts`.
+    # `_synthesize_parent_answers_from_subparts`: a child is consumed either
+    # as a structural sub-part (``3a-i`` under ``3a``) or as a combined-qid
+    # constituent (``6a`` and ``6b`` under ``6ab``; ``3c`` and ``3d`` under
+    # ``3c-d``).
     consumed_children: set[str] = set()
     for parent in merged_set:
+        constituents = set(_expand_combined_qid(parent) or [])
         for cand in ocr_by_qid:
             if cand in scorecards_by_qid:
                 continue  # has its own scorecard — not consumed
-            if _looks_like_subpart(cand, parent):
+            if _looks_like_subpart(cand, parent) or cand in constituents:
                 consumed_children.add(cand)
 
     # Build the answer list we actually render: keep every OCR'd answer except
@@ -1179,7 +1325,7 @@ def discover_exam_folders(
     slug_to_subject: dict[str, str],
     *,
     only_slugs: list[str] | None = None,
-) -> tuple[list[dict], list[str]]:
+) -> tuple[list[ExamFolder], list[str]]:
     """Find subject sub-folders under ``data_dir`` that hold a full exam.
 
     A folder qualifies if it contains a questions PDF, an answers PDF and a
@@ -1190,7 +1336,7 @@ def discover_exam_folders(
     reasons folders were skipped (so nothing is dropped silently).
     """
     data_dir = Path(data_dir)
-    exams: list[dict] = []
+    exams: list[ExamFolder] = []
     notes: list[str] = []
     for folder in sorted(p for p in data_dir.iterdir() if p.is_dir()):
         slug = folder.name
@@ -1309,9 +1455,9 @@ def grade_exam(
     ocr_thinking_level: str | None = "low",
     grading_max_workers: int = 8,
     low_confidence_threshold: float = 0.75,
-    questions: list[str] | str = "all",
+    questions: Literal["all"] | list[str] = _ALL_QUESTIONS,
     config_echo: dict | None = None,
-) -> dict:
+) -> GradeExamResult:
     """Run the full OCR -> rubric -> grade -> assemble pipeline for one exam.
 
     Returns a dict with: ``scorecard``, ``submission``, ``answer_images``,
