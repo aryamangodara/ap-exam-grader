@@ -7,7 +7,7 @@ them precise.
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -140,8 +140,8 @@ class Scorecard(BaseModel):
     set_label: str | None = None
     total_points_earned: float
     total_points_possible: float
-    percentage: float
+    percentage: float = Field(ge=0.0, le=100.0)
     questions: list[QuestionScorecard]
     review_flags: list[str] = Field(default_factory=list)
     generated_at: str
-    config_echo: dict = Field(default_factory=dict)
+    config_echo: dict[str, Any] = Field(default_factory=dict)

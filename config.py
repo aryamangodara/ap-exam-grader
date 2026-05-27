@@ -29,20 +29,18 @@ SUBJECT_SLUG: dict[str, str] = {
     "AP Computer Science Principles":          "computer-science-principles",
 }
 
+_CALCULUS_ADDENDUM = (
+    "Accept algebraically equivalent forms. A sign or arithmetic error that "
+    "propagates through subsequent steps should only cost the point where the "
+    "error was introduced; downstream points may still be earned on follow-through."
+)
+
 # Subject-specific guidance injected into the grading prompt. Each string
 # encodes how that subject's official rubric is meant to be applied (point
 # structure, follow-through rules, what earns vs. doesn't earn credit).
 SUBJECT_GRADING_ADDENDA: dict[str, str] = {
-    "AP Calculus AB": (
-        "Accept algebraically equivalent forms. A sign or arithmetic error that "
-        "propagates through subsequent steps should only cost the point where the "
-        "error was introduced; downstream points may still be earned on follow-through."
-    ),
-    "AP Calculus BC": (
-        "Accept algebraically equivalent forms. A sign or arithmetic error that "
-        "propagates through subsequent steps should only cost the point where the "
-        "error was introduced; downstream points may still be earned on follow-through."
-    ),
+    "AP Calculus AB": _CALCULUS_ADDENDUM,
+    "AP Calculus BC": _CALCULUS_ADDENDUM,
     "AP Precalculus": (
         "Accept algebraically equivalent forms and equivalent exact or decimal answers. "
         "Apply follow-through: an arithmetic or sign error costs only the point where it "
